@@ -11,7 +11,10 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
+import org.mockito.MockedStatic;
 import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.concurrent.CompletableFuture;
 
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
@@ -85,5 +88,17 @@ class BulkNotificationCreateConsumerTest {
                 .thenThrow(new RuntimeException("DB error"));
         consumer.consumeBulkCreate(VALID_MESSAGE);
         verify(producer, timeout(2000).times(1)).push(eq(ERROR_TOPIC), any());
+    }
+
+    @Test
+    void consumeBulkCreate_asyncDispatchThrows_pushesToErrorTopicSynchronously() {
+        when(cbServerProperties.getKafkaTopicNotificationBulkCreateError()).thenReturn(ERROR_TOPIC);
+        try (MockedStatic<CompletableFuture> mockedStatic = mockStatic(CompletableFuture.class)) {
+            mockedStatic.when(() -> CompletableFuture.runAsync(any(Runnable.class)))
+                    .thenThrow(new RuntimeException("dispatch failure"));
+            consumer.consumeBulkCreate(VALID_MESSAGE);
+        }
+        verify(producer, times(1)).push(eq(ERROR_TOPIC), any());
+        verify(notificationService, never()).bulkCreatePeerValidationNotifications(any());
     }
 }
