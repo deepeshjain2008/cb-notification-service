@@ -19,6 +19,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.*;
 import org.springframework.http.HttpStatus;
 
+import java.lang.reflect.Method;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
@@ -104,6 +105,18 @@ class MandatoryNotificationServiceImplTest {
             String json = invocation.getArgument(0, String.class);
             return new ObjectMapper().readTree(json);
         });
+    }
+
+    /**
+     * Invokes a private method on {@code target} via reflection, to exercise defensive
+     * branches that are only reachable by calling the helper directly rather than through
+     * its public entry points (e.g. guards that would otherwise be short-circuited by an
+     * earlier null-check elsewhere in the call chain).
+     */
+    private static Object invokePrivate(Object target, String methodName, Class<?>[] paramTypes, Object... args) throws Exception {
+        Method method = MandatoryNotificationServiceImpl.class.getDeclaredMethod(methodName, paramTypes);
+        method.setAccessible(true);
+        return method.invoke(target, args);
     }
 
     @Nested
@@ -445,6 +458,115 @@ class MandatoryNotificationServiceImplTest {
             Map<String, Object> result = response.getResult();
             assertEquals(1, result.get(TOTAL_COUNT));
         }
+
+        @Test
+        @DisplayName("should leave a non-String message field untouched")
+        void nonStringMessage_isLeftUntouched() throws Exception {
+            mockValidUser();
+            Instant now = Instant.now();
+            Map<String, Object> n = buildNotification("n1", now, "ALERT", false, false);
+            n.put(Constants.MESSAGE, null);
+            mockCassandraReturn(new ArrayList<>(List.of(n)));
+            ApiResponse response = service.getMandatoryNotificationsList(
+                    AUTH_TOKEN, 30, 0, 10, NotificationReadStatus.BOTH, null);
+            assertEquals(HttpStatus.OK, response.getResponseCode());
+            Map<String, Object> result = response.getResult();
+            List<Map<String, Object>> notifications = (List<Map<String, Object>>) result.get(NOTIFICATIONS);
+            assertNull(notifications.get(0).get(Constants.MESSAGE));
+            verify(objectMapper, never()).readTree(anyString());
+        }
+
+        @Test
+        @DisplayName("should keep the raw message string when JSON parsing fails")
+        void messageParseFailure_keepsRawString() throws Exception {
+            mockValidUser();
+            when(objectMapper.readTree(anyString())).thenThrow(new RuntimeException("bad json"));
+            Instant now = Instant.now();
+            Map<String, Object> n = buildNotification("n1", now, "ALERT", false, false);
+            mockCassandraReturn(new ArrayList<>(List.of(n)));
+            ApiResponse response = service.getMandatoryNotificationsList(
+                    AUTH_TOKEN, 30, 0, 10, NotificationReadStatus.BOTH, null);
+            assertEquals(HttpStatus.OK, response.getResponseCode());
+            Map<String, Object> result = response.getResult();
+            List<Map<String, Object>> notifications = (List<Map<String, Object>>) result.get(NOTIFICATIONS);
+            assertEquals(n.get(Constants.MESSAGE), notifications.get(0).get(Constants.MESSAGE));
+        }
+
+        @Test
+        @DisplayName("should leave a created_at already stored as a String unchanged")
+        void createdAtAlreadyString_isLeftUnchanged() throws Exception {
+            mockValidUser();
+            mockObjectMapperReadTree();
+            String createdAtStr = Instant.now().minus(1, ChronoUnit.HOURS).toString();
+            Map<String, Object> n = buildNotification("n1", Instant.now(), "ALERT", false, false);
+            n.put(CREATED_AT, createdAtStr);
+            mockCassandraReturn(new ArrayList<>(List.of(n)));
+            ApiResponse response = service.getMandatoryNotificationsList(
+                    AUTH_TOKEN, 30, 0, 10, NotificationReadStatus.BOTH, null);
+            assertEquals(HttpStatus.OK, response.getResponseCode());
+            Map<String, Object> result = response.getResult();
+            List<Map<String, Object>> notifications = (List<Map<String, Object>>) result.get(NOTIFICATIONS);
+            assertEquals(createdAtStr, notifications.get(0).get(CREATED_AT));
+        }
+
+        @Test
+        @DisplayName("should handle created_at stored as java.util.Date")
+        void createdAtAsDate_isHandledViaGetInstant() throws Exception {
+            mockValidUser();
+            mockObjectMapperReadTree();
+            Map<String, Object> n = buildNotification("n1", Instant.now(), "ALERT", false, false);
+            n.put(CREATED_AT, new Date());
+            mockCassandraReturn(new ArrayList<>(List.of(n)));
+            ApiResponse response = service.getMandatoryNotificationsList(
+                    AUTH_TOKEN, 30, 0, 10, NotificationReadStatus.BOTH, null);
+            assertEquals(HttpStatus.OK, response.getResponseCode());
+            Map<String, Object> result = response.getResult();
+            assertEquals(1, result.get(TOTAL_COUNT));
+        }
+
+        @Test
+        @DisplayName("getFixedOrderIndex defaults a null subType to order index 0 (defensive guard)")
+        void getFixedOrderIndex_nullSubType_defaultsToZero() throws Exception {
+            // buildSubTypeStats' groupingBy classifier never yields a null key in practice
+            // (it would throw NullPointerException("element cannot be mapped to a null key")
+            // before getFixedOrderIndex is ever reached), so this defensive null-guard is
+            // exercised directly via reflection.
+            Object result = invokePrivate(service, "getFixedOrderIndex", new Class<?>[]{String.class}, (Object) null);
+            assertEquals(0, result);
+        }
+
+        @Test
+        @DisplayName("should place an unrecognised sub_type at the end of subtypeStats")
+        void unknownSubType_sortsLast() throws Exception {
+            mockValidUser();
+            mockObjectMapperReadTree();
+            List<Map<String, Object>> records = new ArrayList<>(List.of(
+                    buildNotification("n1", Instant.now(), "BOGUS_TYPE", false, false),
+                    buildNotification("n2", Instant.now(), "ALERT", false, false)
+            ));
+            mockCassandraReturn(records);
+            ApiResponse response = service.getMandatoryNotificationsList(
+                    AUTH_TOKEN, 30, 0, 10, NotificationReadStatus.BOTH, null);
+            assertEquals(HttpStatus.OK, response.getResponseCode());
+            Map<String, Object> result = response.getResult();
+            List<Map<String, Object>> stats = (List<Map<String, Object>>) result.get(SUBTYPE_STATS);
+            assertEquals(2, stats.size());
+            assertEquals("ALERT", stats.get(0).get(NAME));
+            assertEquals("BOGUS_TYPE", stats.get(1).get(NAME));
+        }
+
+        @Test
+        @DisplayName("negative page size triggers the fromIndex/toIndex clamp and results in an internal error")
+        void negativeSize_triggersClampAndInternalError() throws Exception {
+            mockValidUser();
+            mockObjectMapperReadTree();
+            Map<String, Object> n = buildNotification("n1", Instant.now(), "ALERT", false, false);
+            mockCassandraReturn(new ArrayList<>(List.of(n)));
+            ApiResponse response = service.getMandatoryNotificationsList(
+                    AUTH_TOKEN, 30, 0, -5, NotificationReadStatus.BOTH, null);
+            assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, response.getResponseCode());
+            assertEquals(ERR_FETCHING_NOTIFICATION_LIST, response.getParams().getErrMsg());
+        }
     }
 
     @Nested
@@ -721,6 +843,119 @@ class MandatoryNotificationServiceImplTest {
             assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, response.getResponseCode());
             assertEquals(Constants.FAILED, response.getParams().getStatus());
             assertEquals(ERR_UPDATING_NOTIFICATION, response.getParams().getErrMsg());
+        }
+
+        private void mockSuccessfulMarkAsRead() {
+            when(cassandraOperation.getRecordsByProperties(
+                    eq(Constants.KEYSPACE_SUNBIRD), eq(Constants.TABLE_MANDATORY_NOTIFICATION),
+                    anyMap(), anyList(), eq(1)
+            )).thenReturn(List.of(Map.of(NOTIFICATION_ID, "n1")));
+            when(cassandraOperation.updateRecord(
+                    eq(Constants.KEYSPACE_SUNBIRD), eq(Constants.TABLE_MANDATORY_NOTIFICATION),
+                    anyMap(), anyMap()
+            )).thenReturn(Map.of(Constants.RESPONSE, Constants.SUCCESS));
+        }
+
+        @Test
+        @DisplayName("decrementUnreadCount: a null count record is skipped without updating the count")
+        void decrementUnreadCount_nullCountRecord_skipped() {
+            mockValidUser();
+            mockSuccessfulMarkAsRead();
+            List<Map<String, Object>> nullRecord = Collections.singletonList(null);
+            when(cassandraOperation.getRecordsByProperties(
+                    eq(Constants.KEYSPACE_SUNBIRD), eq(Constants.TABLE_UNREAD_NOTIFICATION_COUNT),
+                    anyMap(), anyList(), eq(1)
+            )).thenReturn(nullRecord);
+
+            ApiResponse response = service.markMandatoryNotificationsAsRead(
+                    AUTH_TOKEN, buildRequestBody("n1", "2026-02-28T08:00:00Z"));
+
+            assertEquals(HttpStatus.OK, response.getResponseCode());
+            verify(cassandraOperation, never()).updateRecord(
+                    anyString(), eq(Constants.TABLE_UNREAD_NOTIFICATION_COUNT), anyMap(), anyMap());
+        }
+
+        @Test
+        @DisplayName("decrementUnreadCount: a count record missing the count field is skipped without updating")
+        void decrementUnreadCount_missingCountField_skipped() {
+            mockValidUser();
+            mockSuccessfulMarkAsRead();
+            when(cassandraOperation.getRecordsByProperties(
+                    eq(Constants.KEYSPACE_SUNBIRD), eq(Constants.TABLE_UNREAD_NOTIFICATION_COUNT),
+                    anyMap(), anyList(), eq(1)
+            )).thenReturn(List.of(Map.of(Constants.USER_ID, USER_ID_VAL)));
+
+            ApiResponse response = service.markMandatoryNotificationsAsRead(
+                    AUTH_TOKEN, buildRequestBody("n1", "2026-02-28T08:00:00Z"));
+
+            assertEquals(HttpStatus.OK, response.getResponseCode());
+            verify(cassandraOperation, never()).updateRecord(
+                    anyString(), eq(Constants.TABLE_UNREAD_NOTIFICATION_COUNT), anyMap(), anyMap());
+        }
+
+        @Test
+        @DisplayName("decrementUnreadCount: a count already at zero is skipped without updating")
+        void decrementUnreadCount_countAlreadyZero_skipped() {
+            mockValidUser();
+            mockSuccessfulMarkAsRead();
+            when(cassandraOperation.getRecordsByProperties(
+                    eq(Constants.KEYSPACE_SUNBIRD), eq(Constants.TABLE_UNREAD_NOTIFICATION_COUNT),
+                    anyMap(), anyList(), eq(1)
+            )).thenReturn(List.of(Map.of(Constants.COUNT, 0)));
+
+            ApiResponse response = service.markMandatoryNotificationsAsRead(
+                    AUTH_TOKEN, buildRequestBody("n1", "2026-02-28T08:00:00Z"));
+
+            assertEquals(HttpStatus.OK, response.getResponseCode());
+            verify(cassandraOperation, never()).updateRecord(
+                    anyString(), eq(Constants.TABLE_UNREAD_NOTIFICATION_COUNT), anyMap(), anyMap());
+        }
+
+        @Test
+        @DisplayName("decrementUnreadCount: a positive count is decremented by one")
+        void decrementUnreadCount_positiveCount_decrementsByOne() {
+            mockValidUser();
+            mockSuccessfulMarkAsRead();
+            when(cassandraOperation.getRecordsByProperties(
+                    eq(Constants.KEYSPACE_SUNBIRD), eq(Constants.TABLE_UNREAD_NOTIFICATION_COUNT),
+                    anyMap(), anyList(), eq(1)
+            )).thenReturn(List.of(Map.of(Constants.COUNT, 5)));
+            when(cassandraOperation.updateRecord(
+                    eq(Constants.KEYSPACE_SUNBIRD), eq(Constants.TABLE_UNREAD_NOTIFICATION_COUNT),
+                    anyMap(), anyMap()
+            )).thenReturn(Map.of(Constants.RESPONSE, Constants.SUCCESS));
+
+            ApiResponse response = service.markMandatoryNotificationsAsRead(
+                    AUTH_TOKEN, buildRequestBody("n1", "2026-02-28T08:00:00Z"));
+
+            assertEquals(HttpStatus.OK, response.getResponseCode());
+            ArgumentCaptor<Map<String, Object>> updatesCaptor = ArgumentCaptor.forClass(Map.class);
+            verify(cassandraOperation).updateRecord(
+                    eq(Constants.KEYSPACE_SUNBIRD), eq(Constants.TABLE_UNREAD_NOTIFICATION_COUNT),
+                    updatesCaptor.capture(), eq(Map.of(Constants.USER_ID, USER_ID_VAL)));
+            assertEquals(4, updatesCaptor.getValue().get(Constants.COUNT));
+            assertNotNull(updatesCaptor.getValue().get(Constants.UPDATED_AT));
+        }
+
+        @Test
+        @DisplayName("decrementUnreadCount: a failure updating the count is swallowed and does not affect the read response")
+        void decrementUnreadCount_updateThrows_isSwallowed() {
+            mockValidUser();
+            mockSuccessfulMarkAsRead();
+            when(cassandraOperation.getRecordsByProperties(
+                    eq(Constants.KEYSPACE_SUNBIRD), eq(Constants.TABLE_UNREAD_NOTIFICATION_COUNT),
+                    anyMap(), anyList(), eq(1)
+            )).thenReturn(List.of(Map.of(Constants.COUNT, 5)));
+            when(cassandraOperation.updateRecord(
+                    eq(Constants.KEYSPACE_SUNBIRD), eq(Constants.TABLE_UNREAD_NOTIFICATION_COUNT),
+                    anyMap(), anyMap()
+            )).thenThrow(new RuntimeException("count update failed"));
+
+            ApiResponse response = service.markMandatoryNotificationsAsRead(
+                    AUTH_TOKEN, buildRequestBody("n1", "2026-02-28T08:00:00Z"));
+
+            assertEquals(HttpStatus.OK, response.getResponseCode());
+            assertEquals(Constants.SUCCESS, response.getParams().getStatus());
         }
     }
 }

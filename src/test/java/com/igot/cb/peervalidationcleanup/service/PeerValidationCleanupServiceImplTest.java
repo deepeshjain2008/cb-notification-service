@@ -16,14 +16,24 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.lang.reflect.Method;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -34,6 +44,7 @@ import static org.mockito.Mockito.anyMap;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
@@ -291,6 +302,19 @@ class PeerValidationCleanupServiceImplTest {
             assertThat(summary.deleted()).isZero();
             verify(cassandraOperation, never()).insertBulkRecord(anyString(), anyString(), anyList());
         }
+
+        @Test
+        @DisplayName("Cassandra insertBulkRecord throws is swallowed with a warning and does not affect the summary")
+        void insertBulkRecordThrows_isSwallowed() {
+            String json = buildJson(USER_ID, NOTIFICATION_ID, CREATED_AT_ISO, "PEER_EVALUATION_ASSIGNED", Constants.STATUS_SUBMITTED);
+            doThrow(new RuntimeException("Cassandra audit insert unavailable"))
+                    .when(cassandraOperation).insertBulkRecord(anyString(), anyString(), anyList());
+            var summary = service.processCleanupEvents(List.of(json), TARGET_DATE);
+            assertThat(summary.eligible()).isEqualTo(1);
+            assertThat(summary.deleted()).isEqualTo(1);
+            assertThat(summary.failed()).isZero();
+            verify(cassandraOperation, times(1)).insertBulkRecord(anyString(), anyString(), anyList());
+        }
     }
 
     @Nested
@@ -319,6 +343,15 @@ class PeerValidationCleanupServiceImplTest {
         void noPartitions_zeroEvents() {
             when(cbServerProperties.getCleanupKafkaTopics()).thenReturn(TOPIC);
             when(mockConsumer.partitionsFor(TOPIC)).thenReturn(Collections.emptyList());
+            kafkaService.runCleanup(Instant.now());
+            verify(cassandraOperation, never()).deleteRecord(anyString(), anyString(), anyMap());
+        }
+
+        @Test
+        @DisplayName("null partitions list for topic → zero events processed, no Cassandra calls")
+        void nullPartitions_zeroEvents() {
+            when(cbServerProperties.getCleanupKafkaTopics()).thenReturn(TOPIC);
+            when(mockConsumer.partitionsFor(TOPIC)).thenReturn(null);
             kafkaService.runCleanup(Instant.now());
             verify(cassandraOperation, never()).deleteRecord(anyString(), anyString(), anyMap());
         }
@@ -450,6 +483,400 @@ class PeerValidationCleanupServiceImplTest {
             kafkaService.runCleanup(Instant.now());
             verify(cassandraOperation, never()).deleteRecord(anyString(), anyString(), anyMap());
         }
+    }
+
+    @Nested
+    @DisplayName("CleanupEvent record accessors")
+    class CleanupEventRecordTests {
+
+        @Test
+        @DisplayName("createdAt() returns the constructed Instant")
+        void createdAt_returnsConstructedInstant() {
+            Instant createdAt = Instant.parse(CREATED_AT_ISO);
+            PeerValidationCleanupServiceImpl.CleanupEvent event =
+                    new PeerValidationCleanupServiceImpl.CleanupEvent(
+                            USER_ID, NOTIFICATION_ID, createdAt, Constants.TABLE_PEER_VALIDATION_REQUESTS);
+            assertThat(event.createdAt()).isEqualTo(createdAt);
+        }
+    }
+
+    @Nested
+    @DisplayName("shutdownExecutor – timeout and interrupt branches")
+    class ShutdownExecutorBranches {
+
+        @Test
+        @DisplayName("executor not terminated within timeout logs a warning without throwing")
+        void notTerminatedWithinTimeout_logsWarning() throws Exception {
+            when(cbServerProperties.getCleanupExecutorShutdownTimeoutMinutes()).thenReturn(0);
+            ExecutorService executor = Executors.newFixedThreadPool(1);
+            executor.submit(() -> {
+                try {
+                    Thread.sleep(300);
+                } catch (InterruptedException ignored) {
+                }
+            });
+            try {
+                invokePrivate(service, "shutdownExecutor",
+                        new Class<?>[]{ExecutorService.class}, executor);
+            } finally {
+                executor.shutdownNow();
+            }
+        }
+
+        @Test
+        @DisplayName("interrupted while awaiting termination re-interrupts the thread and logs a warning")
+        void interruptedWhileAwaitingTermination_logsWarning() throws Exception {
+            when(cbServerProperties.getCleanupExecutorShutdownTimeoutMinutes()).thenReturn(1);
+            ExecutorService executor = Executors.newFixedThreadPool(1);
+            executor.submit(() -> {
+                try {
+                    Thread.sleep(300);
+                } catch (InterruptedException ignored) {
+                }
+            });
+            Thread.currentThread().interrupt();
+            try {
+                invokePrivate(service, "shutdownExecutor",
+                        new Class<?>[]{ExecutorService.class}, executor);
+                assertThat(Thread.interrupted()).isTrue();
+            } finally {
+                executor.shutdownNow();
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("invokeAndCollectAuditMaps – interrupted and exception handling")
+    class InvokeAndCollectAuditMapsBranches {
+
+        @Test
+        @DisplayName("executor.invokeAll interrupted propagates through the outer catch and returns an empty list")
+        void invokeAllInterrupted_returnsEmptyList() throws Exception {
+            ExecutorService mockExecutor = mock(ExecutorService.class);
+            when(mockExecutor.invokeAll(anyList())).thenThrow(new InterruptedException("boom"));
+
+            List<Callable<Map<String, Object>>> tasks = List.of(() -> Map.of());
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> result = (List<Map<String, Object>>) invokePrivate(
+                    service, "invokeAndCollectAuditMaps",
+                    new Class<?>[]{List.class, ExecutorService.class}, tasks, mockExecutor);
+
+            assertThat(result).isEmpty();
+            assertThat(Thread.interrupted()).isTrue();
+        }
+
+        @Test
+        @DisplayName("per-future InterruptedException and generic Exception are both swallowed; only non-empty maps survive the filter")
+        void perFutureInterruptedAndGenericException_filteredOut() throws Exception {
+            ExecutorService mockExecutor = mock(ExecutorService.class);
+
+            @SuppressWarnings("unchecked")
+            Future<Map<String, Object>> interruptedFuture = mock(Future.class);
+            when(interruptedFuture.get()).thenThrow(new InterruptedException("boom"));
+
+            @SuppressWarnings("unchecked")
+            Future<Map<String, Object>> failingFuture = mock(Future.class);
+            when(failingFuture.get()).thenThrow(new ExecutionException("boom", new RuntimeException()));
+
+            @SuppressWarnings("unchecked")
+            Future<Map<String, Object>> successfulFuture = mock(Future.class);
+            when(successfulFuture.get()).thenReturn(Map.of(Constants.USER_ID, USER_ID));
+
+            doReturn(List.of(interruptedFuture, failingFuture, successfulFuture))
+                    .when(mockExecutor).invokeAll(anyList());
+
+            List<Callable<Map<String, Object>>> tasks = List.of(() -> Map.of(), () -> Map.of(), () -> Map.of());
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> result = (List<Map<String, Object>>) invokePrivate(
+                    service, "invokeAndCollectAuditMaps",
+                    new Class<?>[]{List.class, ExecutorService.class}, tasks, mockExecutor);
+
+            assertThat(result).hasSize(1);
+            assertThat(Thread.interrupted()).isTrue();
+        }
+    }
+
+    @Nested
+    @DisplayName("resolveActivePartitions – offsetsForTimes / endOffsets combinations")
+    class ResolveActivePartitionsBranches {
+
+        @Mock
+        private KafkaConsumer<String, String> mockConsumer;
+
+        private PeerValidationCleanupServiceImpl plainService;
+
+        @BeforeEach
+        void setUpPlainService() {
+            plainService = new PeerValidationCleanupServiceImpl(cbServerProperties, cassandraOperation, new ObjectMapper());
+        }
+
+        @Test
+        @DisplayName("null OffsetAndTimestamp excludes the partition")
+        void nullOffsetAndTimestamp_excluded() throws Exception {
+            TopicPartition tp = new TopicPartition(TOPIC, 0);
+            when(mockConsumer.offsetsForTimes(anyMap())).thenReturn(Map.of());
+            when(mockConsumer.endOffsets(anyList())).thenReturn(Map.of(tp, 5L));
+
+            @SuppressWarnings("unchecked")
+            Set<TopicPartition> active = (Set<TopicPartition>) invokePrivate(
+                    plainService, "resolveActivePartitions",
+                    new Class<?>[]{KafkaConsumer.class, List.class, long.class},
+                    mockConsumer, List.of(tp), 1000L);
+
+            assertThat(active).isEmpty();
+        }
+
+        @Test
+        @DisplayName("null end offset excludes the partition")
+        void nullEndOffset_excluded() throws Exception {
+            TopicPartition tp = new TopicPartition(TOPIC, 0);
+            when(mockConsumer.offsetsForTimes(anyMap()))
+                    .thenReturn(Map.of(tp, new OffsetAndTimestamp(0L, 0L)));
+            when(mockConsumer.endOffsets(anyList())).thenReturn(Map.of());
+
+            @SuppressWarnings("unchecked")
+            Set<TopicPartition> active = (Set<TopicPartition>) invokePrivate(
+                    plainService, "resolveActivePartitions",
+                    new Class<?>[]{KafkaConsumer.class, List.class, long.class},
+                    mockConsumer, List.of(tp), 1000L);
+
+            assertThat(active).isEmpty();
+        }
+    }
+
+    @Nested
+    @DisplayName("processRecord – window boundary and offset-exhaustion branches")
+    class ProcessRecordBranches {
+
+        @Test
+        @DisplayName("record before window start is skipped but not marked exhausted")
+        void recordBeforeWindowStart_skippedNotExhausted() throws Exception {
+            TopicPartition tp = new TopicPartition(TOPIC, 0);
+            PeerValidationCleanupServiceImpl.TimeWindow window =
+                    new PeerValidationCleanupServiceImpl.TimeWindow(1_000_000L, 2_000_000L);
+            ConsumerRecord<String, String> kafkaRecord = new ConsumerRecord<>(
+                    TOPIC, 0, 0L, 500_000L, TimestampType.CREATE_TIME, -1L, -1, -1, null, "payload");
+            Map<TopicPartition, Long> endOffsets = Map.of(tp, 10L);
+            Set<TopicPartition> exhausted = new HashSet<>();
+            List<String> collected = new ArrayList<>();
+
+            invokePrivate(service, "processRecord",
+                    new Class<?>[]{ConsumerRecord.class, Map.class, PeerValidationCleanupServiceImpl.TimeWindow.class, Consumer.class, Set.class},
+                    kafkaRecord, endOffsets, window, (Consumer<String>) collected::add, exhausted);
+
+            assertThat(collected).isEmpty();
+            assertThat(exhausted).isEmpty();
+        }
+
+        @Test
+        @DisplayName("record within window but missing end offset is not marked exhausted")
+        void recordWithinWindow_missingEndOffset_notExhausted() throws Exception {
+            TopicPartition tp = new TopicPartition(TOPIC, 0);
+            PeerValidationCleanupServiceImpl.TimeWindow window =
+                    new PeerValidationCleanupServiceImpl.TimeWindow(1_000_000L, 2_000_000L);
+            ConsumerRecord<String, String> kafkaRecord = new ConsumerRecord<>(
+                    TOPIC, 0, 0L, 1_500_000L, TimestampType.CREATE_TIME, -1L, -1, -1, null, "payload");
+            Map<TopicPartition, Long> endOffsets = Map.of();
+            Set<TopicPartition> exhausted = new HashSet<>();
+            List<String> collected = new ArrayList<>();
+
+            invokePrivate(service, "processRecord",
+                    new Class<?>[]{ConsumerRecord.class, Map.class, PeerValidationCleanupServiceImpl.TimeWindow.class, Consumer.class, Set.class},
+                    kafkaRecord, endOffsets, window, (Consumer<String>) collected::add, exhausted);
+
+            assertThat(collected).containsExactly("payload");
+            assertThat(exhausted).isEmpty();
+        }
+
+        @Test
+        @DisplayName("record offset well below the log-end offset is not marked exhausted")
+        void recordOffsetBelowEndOffset_notExhausted() throws Exception {
+            TopicPartition tp = new TopicPartition(TOPIC, 0);
+            PeerValidationCleanupServiceImpl.TimeWindow window =
+                    new PeerValidationCleanupServiceImpl.TimeWindow(1_000_000L, 2_000_000L);
+            ConsumerRecord<String, String> kafkaRecord = new ConsumerRecord<>(
+                    TOPIC, 0, 0L, 1_500_000L, TimestampType.CREATE_TIME, -1L, -1, -1, null, "payload");
+            Map<TopicPartition, Long> endOffsets = Map.of(tp, 100L);
+            Set<TopicPartition> exhausted = new HashSet<>();
+            List<String> collected = new ArrayList<>();
+
+            invokePrivate(service, "processRecord",
+                    new Class<?>[]{ConsumerRecord.class, Map.class, PeerValidationCleanupServiceImpl.TimeWindow.class, Consumer.class, Set.class},
+                    kafkaRecord, endOffsets, window, (Consumer<String>) collected::add, exhausted);
+
+            assertThat(collected).containsExactly("payload");
+            assertThat(exhausted).isEmpty();
+        }
+
+        @Test
+        @DisplayName("record at the log-end offset is marked exhausted")
+        void recordAtLogEndOffset_markedExhausted() throws Exception {
+            TopicPartition tp = new TopicPartition(TOPIC, 0);
+            PeerValidationCleanupServiceImpl.TimeWindow window =
+                    new PeerValidationCleanupServiceImpl.TimeWindow(1_000_000L, 2_000_000L);
+            ConsumerRecord<String, String> kafkaRecord = new ConsumerRecord<>(
+                    TOPIC, 0, 4L, 1_500_000L, TimestampType.CREATE_TIME, -1L, -1, -1, null, "payload");
+            Map<TopicPartition, Long> endOffsets = Map.of(tp, 5L);
+            Set<TopicPartition> exhausted = new HashSet<>();
+            List<String> collected = new ArrayList<>();
+
+            invokePrivate(service, "processRecord",
+                    new Class<?>[]{ConsumerRecord.class, Map.class, PeerValidationCleanupServiceImpl.TimeWindow.class, Consumer.class, Set.class},
+                    kafkaRecord, endOffsets, window, (Consumer<String>) collected::add, exhausted);
+
+            assertThat(collected).containsExactly("payload");
+            assertThat(exhausted).containsExactly(tp);
+        }
+    }
+
+    @Nested
+    @DisplayName("resolveActionTable – defensive null guard")
+    class ResolveActionTableBranches {
+
+        @Test
+        @DisplayName("returns null for a null subCategory")
+        void nullSubCategory_returnsNull() throws Exception {
+            Object result = invokePrivate(service, "resolveActionTable", new Class<?>[]{String.class}, (Object) null);
+            assertThat(result).isNull();
+        }
+    }
+
+    @Nested
+    @DisplayName("createKafkaConsumer – real consumer construction")
+    class CreateKafkaConsumerTests {
+
+        @Test
+        @DisplayName("builds a consumer from configured properties without connecting to a broker")
+        void buildsConfiguredConsumer() {
+            when(cbServerProperties.getSpringKafkaBootStrapServers()).thenReturn("localhost:9092");
+            when(cbServerProperties.getCleanupConsumerGroupId()).thenReturn("peer-validation-cleanup-test");
+
+            KafkaConsumer<String, String> consumer = service.createKafkaConsumer();
+            try {
+                assertThat(consumer).isNotNull();
+            } finally {
+                consumer.close();
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("runCleanup – chunk flushing and parallel-path edge cases")
+    class ChunkFlushingAndParallelPath {
+
+        @Mock
+        private KafkaConsumer<String, String> mockConsumer;
+
+        private PeerValidationCleanupServiceImpl kafkaService;
+
+        @BeforeEach
+        void setUpKafkaService() {
+            kafkaService = spy(new PeerValidationCleanupServiceImpl(
+                    cbServerProperties, cassandraOperation, new ObjectMapper()));
+            doReturn(mockConsumer).when(kafkaService).createKafkaConsumer();
+        }
+
+        @AfterEach
+        void closeMockConsumer() {
+            mockConsumer.close();
+        }
+
+        @Test
+        @DisplayName("chunk size of 1 flushes inline for each event, producing one bulk audit insert per event")
+        void chunkSizeOne_flushesInline() {
+            when(cbServerProperties.getCleanupBatchSize()).thenReturn(1);
+            TopicPartition tp = new TopicPartition(TOPIC, 0);
+            PartitionInfo pi = new PartitionInfo(TOPIC, 0, null, null, null);
+            String json1 = buildJson(USER_ID, NOTIFICATION_ID, CREATED_AT_ISO, "PEER_EVALUATION_ASSIGNED", Constants.STATUS_SUBMITTED);
+            String json2 = buildJson("user-002", "notif-002", CREATED_AT_ISO, "PEER_EVALUATION_ASSIGNED", Constants.STATUS_SUBMITTED);
+            LocalDate yesterday = LocalDate.now(ZoneOffset.UTC).minusDays(1);
+            long windowStartMs = yesterday.atTime(0, 1, 0).toInstant(ZoneOffset.UTC).toEpochMilli();
+            long windowEndMs = yesterday.atTime(23, 59, 59).toInstant(ZoneOffset.UTC).toEpochMilli();
+            long midpointMs = (windowStartMs + windowEndMs) / 2;
+            ConsumerRecord<String, String> record1 = new ConsumerRecord<>(
+                    TOPIC, 0, 0L, midpointMs, TimestampType.CREATE_TIME, -1L, -1, -1, null, json1);
+            ConsumerRecord<String, String> record2 = new ConsumerRecord<>(
+                    TOPIC, 0, 1L, midpointMs, TimestampType.CREATE_TIME, -1L, -1, -1, null, json2);
+            ConsumerRecords<String, String> batch =
+                    new ConsumerRecords<>(Map.of(tp, List.of(record1, record2)));
+            when(cbServerProperties.getCleanupKafkaTopics()).thenReturn(TOPIC);
+            when(mockConsumer.partitionsFor(TOPIC)).thenReturn(List.of(pi));
+            when(mockConsumer.offsetsForTimes(anyMap()))
+                    .thenReturn(Map.of(tp, new OffsetAndTimestamp(0L, windowStartMs)));
+            when(mockConsumer.endOffsets(anyList())).thenReturn(Map.of(tp, 5L));
+            doReturn(batch).doReturn(ConsumerRecords.<String, String>empty()).when(mockConsumer).poll(any(Duration.class));
+
+            kafkaService.runCleanup(Instant.now());
+
+            verify(cassandraOperation, times(2)).deleteRecord(anyString(), anyString(), anyMap());
+            verify(cassandraOperation, times(2)).insertBulkRecord(anyString(), anyString(), anyList());
+        }
+
+        @Test
+        @DisplayName("invalid event in the Kafka parallel path increments failed count and skips the audit insert")
+        void invalidEventInParallelPath_skipsAudit() {
+            TopicPartition tp = new TopicPartition(TOPIC, 0);
+            PartitionInfo pi = new PartitionInfo(TOPIC, 0, null, null, null);
+            LocalDate yesterday = LocalDate.now(ZoneOffset.UTC).minusDays(1);
+            long windowStartMs = yesterday.atTime(0, 1, 0).toInstant(ZoneOffset.UTC).toEpochMilli();
+            long windowEndMs = yesterday.atTime(23, 59, 59).toInstant(ZoneOffset.UTC).toEpochMilli();
+            long midpointMs = (windowStartMs + windowEndMs) / 2;
+            ConsumerRecord<String, String> badRecord = new ConsumerRecord<>(
+                    TOPIC, 0, 0L, midpointMs, TimestampType.CREATE_TIME, -1L, -1, -1, null, "not-json{{{");
+            ConsumerRecords<String, String> batch =
+                    new ConsumerRecords<>(Map.of(tp, List.of(badRecord)));
+            when(cbServerProperties.getCleanupKafkaTopics()).thenReturn(TOPIC);
+            when(mockConsumer.partitionsFor(TOPIC)).thenReturn(List.of(pi));
+            when(mockConsumer.offsetsForTimes(anyMap()))
+                    .thenReturn(Map.of(tp, new OffsetAndTimestamp(0L, windowStartMs)));
+            when(mockConsumer.endOffsets(anyList())).thenReturn(Map.of(tp, 5L));
+            doReturn(batch).doReturn(ConsumerRecords.<String, String>empty()).when(mockConsumer).poll(any(Duration.class));
+
+            kafkaService.runCleanup(Instant.now());
+
+            verify(cassandraOperation, never()).deleteRecord(anyString(), anyString(), anyMap());
+            verify(cassandraOperation, never()).insertBulkRecord(anyString(), anyString(), anyList());
+        }
+
+        @Test
+        @DisplayName("Cassandra delete failure in the parallel path increments failed count and skips the audit insert")
+        void cassandraDeleteFailsInParallelPath_skipsAudit() {
+            TopicPartition tp = new TopicPartition(TOPIC, 0);
+            PartitionInfo pi = new PartitionInfo(TOPIC, 0, null, null, null);
+            String json = buildJson(USER_ID, NOTIFICATION_ID, CREATED_AT_ISO, "PEER_EVALUATION_ASSIGNED", Constants.STATUS_SUBMITTED);
+            LocalDate yesterday = LocalDate.now(ZoneOffset.UTC).minusDays(1);
+            long windowStartMs = yesterday.atTime(0, 1, 0).toInstant(ZoneOffset.UTC).toEpochMilli();
+            long windowEndMs = yesterday.atTime(23, 59, 59).toInstant(ZoneOffset.UTC).toEpochMilli();
+            long midpointMs = (windowStartMs + windowEndMs) / 2;
+            ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                    TOPIC, 0, 0L, midpointMs, TimestampType.CREATE_TIME, -1L, -1, -1, null, json);
+            ConsumerRecords<String, String> batch =
+                    new ConsumerRecords<>(Map.of(tp, List.of(record)));
+            when(cbServerProperties.getCleanupKafkaTopics()).thenReturn(TOPIC);
+            when(mockConsumer.partitionsFor(TOPIC)).thenReturn(List.of(pi));
+            when(mockConsumer.offsetsForTimes(anyMap()))
+                    .thenReturn(Map.of(tp, new OffsetAndTimestamp(0L, windowStartMs)));
+            when(mockConsumer.endOffsets(anyList())).thenReturn(Map.of(tp, 5L));
+            doReturn(batch).doReturn(ConsumerRecords.<String, String>empty()).when(mockConsumer).poll(any(Duration.class));
+            doThrow(new RuntimeException("Cassandra unavailable"))
+                    .when(cassandraOperation).deleteRecord(anyString(), anyString(), anyMap());
+
+            kafkaService.runCleanup(Instant.now());
+
+            verify(cassandraOperation, times(1)).deleteRecord(anyString(), anyString(), anyMap());
+            verify(cassandraOperation, never()).insertBulkRecord(anyString(), anyString(), anyList());
+        }
+    }
+
+    /**
+     * Invokes a private method on {@code target} via reflection, to exercise branches
+     * (e.g. defensive null-guards, concurrency edge cases) that are only reachable by
+     * calling the helper method directly rather than through its public entry points.
+     */
+    private static Object invokePrivate(Object target, String methodName, Class<?>[] paramTypes, Object... args) throws Exception {
+        Method method = PeerValidationCleanupServiceImpl.class.getDeclaredMethod(methodName, paramTypes);
+        method.setAccessible(true);
+        return method.invoke(target, args);
     }
 
     private String buildJson(String userId, String notificationId, String createdAt,
