@@ -141,6 +141,15 @@ class EsClientServiceImplTest {
         assertEquals(3, result.size());
     }
 
+    @Test
+    void shouldApplySourceFieldFilterWhenFieldsProvided() throws IOException {
+        Map<String, Object> sourceDoc = Map.of("formId", "form-001");
+        mockEsResponse(List.of(sourceDoc));
+        List<Map<String, Object>> result = esClientService.searchByTerms(
+                INDEX, FIELD, List.of("form-001"), CONTEXT_TYPE, List.of("formId", "status"));
+        assertEquals(1, result.size());
+    }
+
     private void mockEsResponse(List<Map<String, Object>> sources) throws IOException {
         SearchResponse<Map<String, Object>> response = mock(SearchResponse.class);
         HitsMetadata<Map<String, Object>> hitsMetadata = mock(HitsMetadata.class);

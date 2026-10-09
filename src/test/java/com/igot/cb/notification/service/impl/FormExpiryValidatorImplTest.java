@@ -368,6 +368,76 @@ class FormExpiryValidatorImplTest {
         assertEquals(Constants.STATUS_EXPIRED, result.get(0).get(Constants.STATUS));
     }
 
+    @Test
+    void shouldSkipRecordWhenExtractedFormIdIsBlank() throws Exception {
+        Map<String, Object> notification = mutableRecord(Constants.STATUS_PENDING, "{\"formId\":\"\"}");
+        when(objectMapper.readValue(anyString(), any(TypeReference.class)))
+                .thenReturn(Map.of(Constants.FORM_ID, ""));
+        List<Map<String, Object>> result = validator.validateAndMarkExpired(List.of(notification));
+        assertEquals(Constants.STATUS_PENDING, result.get(0).get(Constants.STATUS));
+        verify(esClientService, never()).searchByTerms(anyString(), anyString(), anyList(), anyString(), anyList());
+    }
+
+    @Test
+    void shouldIgnoreRecordWhenStatusIsNotAString() {
+        Map<String, Object> notification = new HashMap<>();
+        notification.put(Constants.STATUS, 42); // non-String status must not match "PENDING"
+        notification.put(Constants.NOTIFICATION_ID, "notif-non-string-status");
+        List<Map<String, Object>> records = List.of(notification);
+        List<Map<String, Object>> result = validator.validateAndMarkExpired(records);
+        assertEquals(records, result);
+        verify(esClientService, never()).searchByTerms(anyString(), anyString(), anyList(), anyString(), anyList());
+    }
+
+    @Test
+    void shouldSkipMalformedEsDocumentsAndTreatMissingEndDatesAsNotExpired() throws Exception {
+        Map<String, Object> notif3 = mutableRecord(Constants.STATUS_PENDING, "{\"formId\":\"form-003\"}");
+        Map<String, Object> notif4 = mutableRecord(Constants.STATUS_PENDING, "{\"formId\":\"form-004\"}");
+
+        when(objectMapper.readValue(eq("{\"formId\":\"form-003\"}"), any(TypeReference.class)))
+                .thenReturn(Map.of(Constants.FORM_ID, "form-003"));
+        when(objectMapper.readValue(eq("{\"formId\":\"form-004\"}"), any(TypeReference.class)))
+                .thenReturn(Map.of(Constants.FORM_ID, "form-004"));
+        when(cacheManager.get(anyString())).thenReturn(Optional.empty());
+
+        Map<String, Object> docMissingFormId = Map.of("someField", "x"); // FORM_ID key absent entirely
+        Map<String, Object> docBlankFormId = Map.of(Constants.FORM_ID, ""); // blank FORM_ID
+        Map<String, Object> docNoEndDateAtAll = Map.of(Constants.FORM_ID, "form-003"); // no endDate, no additionalProperties
+        Map<String, Object> docAdditionalPropertiesWithoutEndDate = Map.of(
+                Constants.FORM_ID, "form-004",
+                Constants.ADDITIONAL_PROPERTIES, Map.of("other", "value")); // additionalProperties present but no endDate
+
+        when(esClientService.searchByTerms(anyString(), anyString(), anyList(), anyString(), anyList()))
+                .thenReturn(List.of(docMissingFormId, docBlankFormId, docNoEndDateAtAll, docAdditionalPropertiesWithoutEndDate));
+
+        List<Map<String, Object>> result = validator.validateAndMarkExpired(List.of(notif3, notif4));
+
+        assertEquals(Constants.STATUS_PENDING, result.get(0).get(Constants.STATUS));
+        assertEquals(Constants.STATUS_PENDING, result.get(1).get(Constants.STATUS));
+        verify(esClientService, times(1)).searchByTerms(anyString(), anyString(), anyList(), anyString(), anyList());
+    }
+
+    @Test
+    void shouldReturnNullFormIdWhenMessageDataFieldIsNotAList() throws Exception {
+        Map<String, Object> notification = mutableNotificationRecord(Constants.STATUS_PENDING, null, "{}");
+        when(objectMapper.readValue(anyString(), any(TypeReference.class)))
+                .thenReturn(Map.of());
+        List<Map<String, Object>> result = validator.validateAndMarkExpired(List.of(notification));
+        assertEquals(Constants.STATUS_PENDING, result.get(0).get(Constants.STATUS));
+        verify(esClientService, never()).searchByTerms(anyString(), anyString(), anyList(), anyString(), anyList());
+    }
+
+    @Test
+    void shouldReturnNullFormIdWhenFirstMessageDataEntryIsNotAMap() throws Exception {
+        Map<String, Object> notification = mutableNotificationRecord(Constants.STATUS_PENDING, null,
+                "{\"data\":[\"not-a-map\"]}");
+        when(objectMapper.readValue(anyString(), any(TypeReference.class)))
+                .thenReturn(Map.of(Constants.DATA, List.of("not-a-map")));
+        List<Map<String, Object>> result = validator.validateAndMarkExpired(List.of(notification));
+        assertEquals(Constants.STATUS_PENDING, result.get(0).get(Constants.STATUS));
+        verify(esClientService, never()).searchByTerms(anyString(), anyString(), anyList(), anyString(), anyList());
+    }
+
     private Map<String, Object> mutableNotificationRecord(String status, String metadata, String message) {
         Map<String, Object> notification = new HashMap<>();
         notification.put(Constants.STATUS, status);

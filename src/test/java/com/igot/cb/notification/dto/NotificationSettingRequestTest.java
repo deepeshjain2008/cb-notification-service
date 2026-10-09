@@ -108,6 +108,56 @@ class NotificationSettingRequestTest {
         assertTrue(str.contains("enabled=false"));
     }
 
+    private static class NonCanEqualSubclass extends NotificationSettingRequest {
+        @Override
+        public boolean canEqual(Object other) {
+            return false;
+        }
+    }
 
+    @Test
+    void testEquals_canEqualFalse() {
+        NotificationSettingRequest r1 = new NotificationSettingRequest("EMAIL", true);
+        NonCanEqualSubclass r2 = new NonCanEqualSubclass();
 
+        assertNotEquals(r1, r2);
+    }
+
+    @Test
+    void testEquals_notificationTypeDirectCalls_allBranches() {
+        NotificationSettingRequest bothNull1 = new NotificationSettingRequest(null, true);
+        NotificationSettingRequest bothNull2 = new NotificationSettingRequest(null, true);
+        assertTrue(bothNull1.equals(bothNull2));
+
+        NotificationSettingRequest thisNull = new NotificationSettingRequest(null, true);
+        NotificationSettingRequest otherNonNull = new NotificationSettingRequest("EMAIL", true);
+        assertFalse(thisNull.equals(otherNonNull));
+
+        NotificationSettingRequest thisNonNull = new NotificationSettingRequest("EMAIL", true);
+        NotificationSettingRequest otherNull = new NotificationSettingRequest(null, true);
+        assertFalse(thisNonNull.equals(otherNull));
+
+        NotificationSettingRequest thisNonNull2 = new NotificationSettingRequest("EMAIL", true);
+        NotificationSettingRequest otherNonNullEqual = new NotificationSettingRequest("EMAIL", true);
+        assertTrue(thisNonNull2.equals(otherNonNullEqual));
+
+        NotificationSettingRequest thisNonNull3 = new NotificationSettingRequest("EMAIL", true);
+        NotificationSettingRequest otherNonNullDifferent = new NotificationSettingRequest("SMS", true);
+        assertFalse(thisNonNull3.equals(otherNonNullDifferent));
+    }
+
+    @Test
+    void testHashCode_enabledFalse() {
+        NotificationSettingRequest r1 = new NotificationSettingRequest("EMAIL", false);
+        NotificationSettingRequest r2 = new NotificationSettingRequest("EMAIL", false);
+        assertEquals(r1.hashCode(), r2.hashCode());
+    }
+
+    @Test
+    void testCanEqual_directCalls() {
+        NotificationSettingRequest r1 = new NotificationSettingRequest("EMAIL", true);
+
+        assertTrue(r1.canEqual(new NotificationSettingRequest("SMS", false)));
+        assertFalse(r1.canEqual("some string"));
+    }
 }

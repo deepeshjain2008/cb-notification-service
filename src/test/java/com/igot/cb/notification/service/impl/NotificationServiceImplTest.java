@@ -7,7 +7,9 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.igot.cb.notification.entity.NotificationSettingEntity;
 import com.igot.cb.notification.enums.NotificationReadStatus;
 import com.igot.cb.notification.enums.NotificationSubCategory;
+import com.igot.cb.notification.enums.NotificationSubType;
 import com.igot.cb.notification.repository.NotificationSettingRepository;
+import com.igot.cb.notification.service.FormExpiryValidator;
 import com.igot.cb.producer.Producer;
 import com.igot.cb.util.CbServerProperties;
 import com.igot.cb.util.Constants;
@@ -57,6 +59,9 @@ class NotificationServiceImplTest {
 
     @Mock
     private Producer producer;
+
+    @Mock
+    private FormExpiryValidator formExpiryValidator;
 
     private static final String CREATED_AT = "created_at";
     private static final String READ = "read";
@@ -2654,5 +2659,1424 @@ class NotificationServiceImplTest {
                 argThat(map -> Boolean.TRUE.equals(map.get("read"))),
                 eq(Map.of(USER_ID, userId, CREATED_AT, createdAt))
         );
+    }
+
+    // ===================== Additional coverage: bulkCreateNotifications branches =====================
+
+    @Test
+    void testBulkCreateNotifications_BlankNotificationType_ReturnsBadRequest() throws Exception {
+        String payload = "{ \"request\": { " +
+                "\"user_ids\": [ {\"user_id\": \"user1\"} ]" +
+                "} }";
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+
+        ApiResponse response = notificationService.bulkCreateNotifications(userNotificationDetail);
+
+        assertEquals(HttpStatus.BAD_REQUEST, response.getResponseCode());
+        assertEquals("'notification_type' is required", response.getParams().getErrMsg());
+    }
+
+    @Test
+    void testBulkCreateNotifications_GlobalSubCategory_DelegatesToCreateGlobalNotification() throws Exception {
+        String payload = "{ \"request\": { " +
+                "\"type\": \"content\"," +
+                "\"sub_category\": \"EVENT_PUBLISHED\"," +
+                "\"user_ids\": [ {\"user_id\": \"user1\"} ]" +
+                "} }";
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+
+        when(cassandraOperation.insertRecord(anyString(), anyString(), anyMap()))
+                .thenReturn(Map.of(Constants.RESPONSE, Constants.SUCCESS));
+
+        ApiResponse response = notificationService.bulkCreateNotifications(userNotificationDetail);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        assertNotNull(response.getResult());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        assertTrue(result.containsKey("notification"));
+        verify(cassandraOperation).insertRecord(eq(KEYSPACE_SUNBIRD), eq(TABLE_GLOBAL_NOTIFICATION), anyMap());
+        verify(cassandraOperation, never()).insertBulkRecord(any(), any(), any());
+    }
+
+    @Test
+    void testBulkCreateNotifications_SkipsEmptyUserId() throws Exception {
+        String payload = "{ \"request\": { " +
+                "\"type\": \"comment\"," +
+                "\"sub_category\": \"CONTENT_PUBLISHED\"," +
+                "\"user_ids\": [ {\"user_id\": \"\"}, {\"user_id\": \"user1\"} ]" +
+                "} }";
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+
+        ApiResponse mockInsertResponse = new ApiResponse();
+        mockInsertResponse.setResponseCode(HttpStatus.OK);
+        when(cassandraOperation.insertBulkRecord(anyString(), anyString(), anyList()))
+                .thenReturn(mockInsertResponse);
+
+        ApiResponse response = notificationService.bulkCreateNotifications(userNotificationDetail);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        List<Map<String, Object>> notifications = (List<Map<String, Object>>) result.get("notifications");
+        assertEquals(1, notifications.size());
+    }
+
+    @Test
+    void testBulkCreateNotifications_SkipsDisabledUserAmongMultiple() throws Exception {
+        String payload = "{ \"request\": { " +
+                "\"type\": \"comment\"," +
+                "\"sub_category\": \"CONTENT_PUBLISHED\"," +
+                "\"user_ids\": [ {\"user_id\": \"user1\"}, {\"user_id\": \"user2\"} ]" +
+                "} }";
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+
+        NotificationSettingEntity disabled = new NotificationSettingEntity();
+        disabled.setEnabled(false);
+        when(notificationSettingRepository.findByUserIdAndNotificationTypeAndIsDeletedFalse("user1", "comment"))
+                .thenReturn(Optional.of(disabled));
+        when(notificationSettingRepository.findByUserIdAndNotificationTypeAndIsDeletedFalse("user2", "comment"))
+                .thenReturn(Optional.empty());
+
+        ApiResponse mockInsertResponse = new ApiResponse();
+        mockInsertResponse.setResponseCode(HttpStatus.OK);
+        when(cassandraOperation.insertBulkRecord(anyString(), anyString(), anyList()))
+                .thenReturn(mockInsertResponse);
+
+        ApiResponse response = notificationService.bulkCreateNotifications(userNotificationDetail);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        List<Map<String, Object>> notifications = (List<Map<String, Object>>) result.get("notifications");
+        assertEquals(1, notifications.size());
+
+        ArgumentCaptor<List<Map<String, Object>>> captor = ArgumentCaptor.forClass(List.class);
+        verify(cassandraOperation).insertBulkRecord(anyString(), anyString(), captor.capture());
+        assertEquals(1, captor.getValue().size());
+        assertEquals("user2", captor.getValue().get(0).get(Constants.USER_ID));
+    }
+
+    @Test
+    void testBulkCreateNotifications_MessageWithoutDataNode_CreatesDataNodeWithCount() throws Exception {
+        String payload = "{ \"request\": { " +
+                "\"type\": \"comment\"," +
+                "\"sub_category\": \"CONTENT_PUBLISHED\"," +
+                "\"message\": {\"title\": \"hello\"}," +
+                "\"user_ids\": [ {\"user_id\": \"user1\"} ]" +
+                "} }";
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+
+        ApiResponse mockInsertResponse = new ApiResponse();
+        mockInsertResponse.setResponseCode(HttpStatus.OK);
+        when(cassandraOperation.insertBulkRecord(anyString(), anyString(), anyList()))
+                .thenReturn(mockInsertResponse);
+
+        ApiResponse response = notificationService.bulkCreateNotifications(userNotificationDetail);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        ArgumentCaptor<List<Map<String, Object>>> captor = ArgumentCaptor.forClass(List.class);
+        verify(cassandraOperation).insertBulkRecord(anyString(), anyString(), captor.capture());
+        String messageStr = (String) captor.getValue().get(0).get(Constants.MESSAGE);
+        assertNotNull(messageStr);
+        assertTrue(messageStr.contains("\"data\""));
+        assertTrue(messageStr.contains("\"count\":1"));
+    }
+
+    @Test
+    void testBulkCreateNotifications_ClubbableSubCategory_CallsClubNotification_UsesIndividualTable() throws Exception {
+        String payload = "{ \"request\": { " +
+                "\"type\": \"comment\"," +
+                "\"sub_category\": \"LIKED_POST\"," +
+                "\"message\": {\"data\": {\"discussionId\": \"disc-1\"}}," +
+                "\"user_ids\": [ {\"user_id\": \"user1\"} ]" +
+                "} }";
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), isNull(), anyInt()))
+                .thenReturn(Collections.emptyList());
+        when(cassandraOperation.insertRecord(eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap()))
+                .thenReturn(Map.of(Constants.RESPONSE, Constants.SUCCESS));
+
+        ApiResponse mockInsertResponse = new ApiResponse();
+        mockInsertResponse.setResponseCode(HttpStatus.OK);
+        when(cassandraOperation.insertBulkRecord(eq(KEYSPACE_SUNBIRD), eq(TABLE_INDIVIDUAL_NOTIFICATION), anyList()))
+                .thenReturn(mockInsertResponse);
+
+        ApiResponse response = notificationService.bulkCreateNotifications(userNotificationDetail);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        verify(cassandraOperation).insertBulkRecord(eq(KEYSPACE_SUNBIRD), eq(TABLE_INDIVIDUAL_NOTIFICATION), anyList());
+        verify(cassandraOperation).insertRecord(eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap());
+    }
+
+    @Test
+    void testBulkCreateNotifications_InsertBulkRecordFails_ReturnsInternalServerError() throws Exception {
+        String payload = "{ \"request\": { " +
+                "\"type\": \"comment\"," +
+                "\"sub_category\": \"CONTENT_PUBLISHED\"," +
+                "\"user_ids\": [ {\"user_id\": \"user1\"} ]" +
+                "} }";
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+
+        ApiResponse failedResponse = new ApiResponse();
+        failedResponse.put(Constants.RESPONSE, Constants.FAILED);
+        when(cassandraOperation.insertBulkRecord(anyString(), anyString(), anyList()))
+                .thenReturn(failedResponse);
+
+        ApiResponse response = notificationService.bulkCreateNotifications(userNotificationDetail);
+
+        assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, response.getResponseCode());
+        assertEquals("Failed to insert notifications", response.getParams().getErrMsg());
+    }
+
+    // ===================== Additional coverage: readByUserIdAndNotificationId found branch =====================
+
+    @Test
+    void testReadByUserIdAndNotificationId_Found() {
+        Map<String, Object> notification = new HashMap<>();
+        notification.put(NOTIFICATION_ID, NOTIFICATION_ID_1);
+        notification.put(CREATED_AT, Instant.now());
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(USER_ID);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), isNull(), anyInt()))
+                .thenReturn(List.of(notification));
+
+        ApiResponse response = notificationService.readByUserIdAndNotificationId(NOTIFICATION_ID_1, AUTH_TOKEN);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        assertEquals(NOTIFICATION_ID_1, result.get(NOTIFICATION_ID));
+    }
+
+    // ===================== Additional coverage: getNotificationsByUserIdAndLastXDays - formExpiryValidator =====================
+
+    @Test
+    void testGetNotificationsByUserIdAndLastXDays_CallsFormExpiryValidator_WhenPeerValidationNotificationsPresent() {
+        String authToken = "Bearer xyz";
+        String userId = "user-77";
+        Instant now = Instant.now();
+
+        Map<String, Object> peerNotif = new HashMap<>();
+        peerNotif.put(NOTIFICATION_ID, "n-peer");
+        peerNotif.put(Constants.CREATED_AT, now.minusSeconds(100));
+        peerNotif.put(Constants.READ, false);
+        peerNotif.put(Constants.CATEGORY, Constants.CATEGORY_PEER_VALIDATION);
+
+        when(accessTokenValidator.fetchUserIdFromAccessToken(authToken)).thenReturn(userId);
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(Constants.TABLE_USER_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of(peerNotif));
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(Constants.TABLE_GLOBAL_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of());
+
+        NotificationServiceImpl spyService = Mockito.spy(notificationService);
+        doAnswer(invocation -> invocation.getArgument(0)).when(spyService).prepareNotificationResponse(any());
+
+        ApiResponse response = spyService.getNotificationsByUserIdAndLastXDays(
+                authToken, 10, 0, 10, null, null);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        verify(formExpiryValidator, times(1)).validateAndMarkExpired(argThat(list -> list.size() == 1));
+    }
+
+    // ===================== Additional coverage: getFixedOrderIndex branches =====================
+
+    @Test
+    void testGetFixedOrderIndex_ValidSubType_ReturnsOrdinal() throws Exception {
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("getFixedOrderIndex", String.class);
+        method.setAccessible(true);
+        int result = (int) method.invoke(notificationService, "ALERT");
+        assertEquals(NotificationSubType.ALERT.ordinal(), result);
+    }
+
+    @Test
+    void testGetFixedOrderIndex_InvalidSubType_ReturnsMaxValue() throws Exception {
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("getFixedOrderIndex", String.class);
+        method.setAccessible(true);
+        int result = (int) method.invoke(notificationService, "NOT_A_REAL_SUBTYPE");
+        assertEquals(Integer.MAX_VALUE, result);
+    }
+
+    @Test
+    void testGetFixedOrderIndex_NullSubType_ReturnsZero() throws Exception {
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("getFixedOrderIndex", String.class);
+        method.setAccessible(true);
+        int result = (int) method.invoke(notificationService, (String) null);
+        assertEquals(0, result);
+    }
+
+    @Test
+    void testGetNotificationsByUserIdAndLastXDays_SortsSubTypeStatsByFixedOrder() {
+        String authToken = "Bearer token";
+        String userId = "u-order";
+        Instant now = Instant.now();
+        when(accessTokenValidator.fetchUserIdFromAccessToken(authToken)).thenReturn(userId);
+
+        Map<String, Object> notif1 = new HashMap<>();
+        notif1.put(Constants.NOTIFICATION_ID, "n1");
+        notif1.put(Constants.CREATED_AT, now.minusSeconds(10));
+        notif1.put(Constants.IS_DELETED, false);
+        notif1.put(Constants.READ, false);
+        notif1.put(Constants.SUB_TYPE, "PROMOTIONAL");
+
+        Map<String, Object> notif2 = new HashMap<>();
+        notif2.put(Constants.NOTIFICATION_ID, "n2");
+        notif2.put(Constants.CREATED_AT, now.minusSeconds(20));
+        notif2.put(Constants.IS_DELETED, false);
+        notif2.put(Constants.READ, false);
+        notif2.put(Constants.SUB_TYPE, "ALERT");
+
+        when(cassandraOperation.getRecordsByProperties(any(), eq(Constants.TABLE_USER_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of(notif1, notif2));
+        when(cassandraOperation.getRecordsByProperties(any(), eq(Constants.TABLE_GLOBAL_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of());
+
+        NotificationServiceImpl spyService = Mockito.spy(notificationService);
+        doAnswer(invocation -> invocation.getArgument(0)).when(spyService).prepareNotificationResponse(any());
+
+        ApiResponse response = spyService.getNotificationsByUserIdAndLastXDays(
+                authToken, 7, 0, 10, null, null);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        List<Map<String, Object>> subTypeStats = (List<Map<String, Object>>) result.get(SUBTYPE_STATS);
+        assertEquals(2, subTypeStats.size());
+        assertEquals("ALERT", subTypeStats.get(0).get(NAME));
+        assertEquals("PROMOTIONAL", subTypeStats.get(1).get(NAME));
+    }
+
+    // ===================== Additional coverage: processReadUpdate branches =====================
+
+    @Test
+    void testProcessReadUpdate_SkipsAlreadyReadNotification() throws Exception {
+        Map<String, Object> notification = new HashMap<>();
+        notification.put(NOTIFICATION_ID, NOTIFICATION_ID_1);
+        notification.put(READ, true);
+        notification.put(CREATED_AT, Instant.now());
+        List<Map<String, Object>> notifications = List.of(notification);
+        List<String> targetIds = List.of(NOTIFICATION_ID_1);
+
+        Method method = NotificationServiceImpl.class.getDeclaredMethod(
+                "processReadUpdate", String.class, List.class, List.class);
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> result = (List<Map<String, Object>>) method.invoke(
+                notificationService, USER_ID, notifications, targetIds);
+
+        assertTrue(result.isEmpty());
+        verify(cassandraOperation, never()).updateRecord(any(), any(), anyMap(), anyMap());
+    }
+
+    @Test
+    void testProcessReadUpdate_LogsWarning_WhenUpdateFails() throws Exception {
+        Map<String, Object> notification = new HashMap<>();
+        notification.put(NOTIFICATION_ID, NOTIFICATION_ID_1);
+        notification.put(READ, false);
+        notification.put(CREATED_AT, Instant.now());
+        List<Map<String, Object>> notifications = List.of(notification);
+        List<String> targetIds = List.of(NOTIFICATION_ID_1);
+
+        when(cassandraOperation.getRecordsByProperties(any(), any(), anyMap(), any(), anyInt()))
+                .thenReturn(notifications);
+        when(cassandraOperation.updateRecord(any(), any(), anyMap(), anyMap()))
+                .thenReturn(Map.of(Constants.RESPONSE, Constants.FAILED));
+
+        Method method = NotificationServiceImpl.class.getDeclaredMethod(
+                "processReadUpdate", String.class, List.class, List.class);
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> result = (List<Map<String, Object>>) method.invoke(
+                notificationService, USER_ID, notifications, targetIds);
+
+        assertTrue(result.isEmpty());
+    }
+
+    // ===================== Additional coverage: insertAndMarkGlobalNotificationsAsRead skip branch =====================
+
+    @Test
+    void testInsertAndMarkGlobalNotificationsAsRead_SkipsExisting() throws Exception {
+        Map<String, Object> globalNotif = new HashMap<>();
+        globalNotif.put(NOTIFICATION_ID, NOTIFICATION_ID_1);
+        globalNotif.put(CREATED_AT, Instant.now());
+
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), eq(List.of(NOTIFICATION_ID)), anyInt()))
+                .thenReturn(List.of(Map.of(NOTIFICATION_ID, NOTIFICATION_ID_1)));
+
+        Method method = NotificationServiceImpl.class.getDeclaredMethod(
+                "insertAndMarkGlobalNotificationsAsRead", String.class, List.class);
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> result = (List<Map<String, Object>>) method.invoke(
+                notificationService, USER_ID, List.of(globalNotif));
+
+        assertTrue(result.isEmpty());
+        verify(cassandraOperation, never()).insertRecord(eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap());
+    }
+
+    // ===================== Additional coverage: markNotificationsAsDeleted success branch =====================
+
+    @Test
+    void testMarkNotificationsAsDeleted_SuccessfulUpdate_AddsToResult() {
+        List<String> notificationIds = List.of(NOTIFICATION_ID_1);
+        Instant createdAt = Instant.now();
+        Map<String, Object> existingNotif = new HashMap<>();
+        existingNotif.put(NOTIFICATION_ID, NOTIFICATION_ID_1);
+        existingNotif.put(CREATED_AT, createdAt);
+
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(USER_ID);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), isNull(), anyInt()))
+                .thenReturn(List.of(existingNotif));
+        when(cassandraOperation.updateRecord(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), anyMap()))
+                .thenReturn(Map.of(Constants.RESPONSE, Constants.SUCCESS));
+
+        ApiResponse response = notificationService.markNotificationsAsDeleted(AUTH_TOKEN, notificationIds);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        List<Map<String, Object>> updated = (List<Map<String, Object>>) result.get(NOTIFICATIONS);
+        assertEquals(1, updated.size());
+        assertEquals(NOTIFICATION_ID_1, updated.get(0).get(ID));
+        assertEquals(true, updated.get(0).get(IS_DELETED));
+    }
+
+    // ===================== Additional coverage: getResetNotificationCount failure branch =====================
+
+    @Test
+    void testGetResetNotificationCount_UpdateFails_LogsWarningButReturnsOk() {
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(USER_ID);
+        when(cassandraOperation.updateRecord(anyString(), anyString(), anyMap(), anyMap()))
+                .thenReturn(Map.of(Constants.RESPONSE, Constants.FAILED));
+
+        ApiResponse response = notificationService.getResetNotificationCount(AUTH_TOKEN);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+    }
+
+    // ===================== Additional coverage: incrementUnreadCountManually branches =====================
+
+    @Test
+    void testIncrementUnreadCountManually_IncrementsExistingCount() throws Exception {
+        Map<String, Object> existing = new HashMap<>();
+        existing.put(COUNT, 5);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_UNREAD_NOTIFICATION_COUNT), anyMap(), eq(List.of(COUNT)), eq(1)))
+                .thenReturn(List.of(existing));
+
+        Method method = NotificationServiceImpl.class.getDeclaredMethod(
+                "incrementUnreadCountManually", String.class, String.class, String.class);
+        method.setAccessible(true);
+        method.invoke(notificationService, KEYSPACE_SUNBIRD, TABLE_UNREAD_NOTIFICATION_COUNT, USER_ID);
+
+        verify(cassandraOperation).updateRecord(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_UNREAD_NOTIFICATION_COUNT),
+                argThat(m -> Integer.valueOf(6).equals(m.get(COUNT))),
+                anyMap());
+    }
+
+    @Test
+    void testIncrementUnreadCountManually_HandlesExceptionGracefully() throws Exception {
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_UNREAD_NOTIFICATION_COUNT), anyMap(), anyList(), anyInt()))
+                .thenThrow(new RuntimeException("Cassandra down"));
+
+        Method method = NotificationServiceImpl.class.getDeclaredMethod(
+                "incrementUnreadCountManually", String.class, String.class, String.class);
+        method.setAccessible(true);
+        assertDoesNotThrow(() -> method.invoke(notificationService, KEYSPACE_SUNBIRD, TABLE_UNREAD_NOTIFICATION_COUNT, USER_ID));
+    }
+
+    // ===================== Additional coverage: bulkCreatePeerValidationNotifications branches =====================
+
+    @Test
+    void testBulkCreatePeerValidationNotifications_NonSurveySubCategory_ValidatesSuccessfully() {
+        Map<String, Object> surveyData = new LinkedHashMap<>();
+        surveyData.put("title", "Q1");
+        Map<String, Object> message = new LinkedHashMap<>();
+        message.put(DATA, List.of(surveyData));
+        Map<String, Object> req = new LinkedHashMap<>();
+        req.put(USER_ID, "user-1");
+        req.put(TYPE, "peer-review");
+        req.put(CATEGORY, "PEER_VALIDATION");
+        req.put(SUB_CATEGORY, "CONTENT_PUBLISHED");
+        req.put(SUB_TYPE, "peer_evaluation");
+        req.put(SOURCE, "competency-passbook");
+        req.put(MESSAGE, message);
+
+        when(cbServerProperties.isPeerValidationNotificationSettingCheckEnabled()).thenReturn(false);
+        when(cbServerProperties.getPeerValidationBulkUserNotificationLimit()).thenReturn(100);
+        when(cbServerProperties.getPeerValidationBulkCreatedAtOffsetMs()).thenReturn(1L);
+        when(cassandraOperation.insertBulkRecord(anyString(), anyString(), anyList()))
+                .thenReturn(new ApiResponse());
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(TABLE_UNREAD_NOTIFICATION_COUNT), anyMap(), anyList(), anyInt()))
+                .thenReturn(Collections.emptyList());
+
+        Map<String, Object> body = Map.of(REQUEST, List.of(req));
+        ApiResponse response = notificationService.bulkCreatePeerValidationNotifications(body);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        assertEquals(1, result.get(PROCESSED_COUNT));
+        verify(cassandraOperation, never()).insertBulkRecord(anyString(), eq(TABLE_PEER_VALIDATION_REQUESTS), anyList());
+        verify(cassandraOperation, never()).insertBulkRecord(anyString(), eq(TABLE_PEER_VALIDATION_REVIEWS), anyList());
+    }
+
+    @Test
+    void testBulkCreatePeerValidationNotifications_BuildRecordFails_AddsToFailures() throws Exception {
+        Map<String, Object> surveyData = new LinkedHashMap<>();
+        surveyData.put("surveyEndDate", Instant.now().plusSeconds(86400).toString());
+        Map<String, Object> message = new LinkedHashMap<>();
+        message.put(DATA, List.of(surveyData));
+        Map<String, Object> req = new LinkedHashMap<>();
+        req.put(USER_ID, "user-1");
+        req.put(TYPE, "peer-review");
+        req.put(CATEGORY, "PEER_VALIDATION");
+        req.put(SUB_CATEGORY, "PEER_EVALUATION_ASSIGNED");
+        req.put(SUB_TYPE, "peer_evaluation");
+        req.put(SOURCE, "competency-passbook");
+        req.put(MESSAGE, message);
+
+        when(cbServerProperties.isPeerValidationNotificationSettingCheckEnabled()).thenReturn(false);
+        when(cbServerProperties.getPeerValidationBulkUserNotificationLimit()).thenReturn(100);
+        when(cbServerProperties.getPeerValidationBulkCreatedAtOffsetMs()).thenReturn(1L);
+        when(objectMapper.writeValueAsString(any())).thenThrow(new RuntimeException("serialization boom"));
+
+        Map<String, Object> body = Map.of(REQUEST, List.of(req));
+        ApiResponse response = notificationService.bulkCreatePeerValidationNotifications(body);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        assertEquals(1, result.get(FAILED_COUNT));
+        assertEquals(0, result.get(PROCESSED_COUNT));
+        List<Map<String, Object>> failures = (List<Map<String, Object>>) result.get(FAILED_KEY);
+        assertEquals("user-1", failures.get(0).get(USER_ID));
+        verify(cassandraOperation, never()).insertBulkRecord(anyString(), eq(TABLE_USER_NOTIFICATION), anyList());
+    }
+
+    // ===================== Additional coverage: getPeerValidationNotifications exception branch =====================
+
+    @Test
+    void testGetPeerValidationNotifications_ThrowsException_ReturnsInternalServerError() {
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(USER_ID);
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(TABLE_PEER_VALIDATION_REQUESTS), anyMap(), isNull(), anyInt()))
+                .thenThrow(new RuntimeException("Cassandra down"));
+
+        ApiResponse response = notificationService.getPeerValidationNotifications(
+                AUTH_TOKEN, SUB_CATEGORY_PEER_EVALUATION_ASSIGNED, 30, 0, 10);
+
+        assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, response.getResponseCode());
+        assertEquals(INTERNAL_ERROR_MSG, response.getParams().getErrMsg());
+    }
+
+    // ===================== Additional coverage: deserializeJsonField branches =====================
+
+    @Test
+    void testDeserializeJsonField_ValidJson_ParsesSuccessfully() throws Exception {
+        Map<String, Object> map = new HashMap<>();
+        map.put(METADATA, "{\"key\":\"value\"}");
+        ObjectMapper realMapper = new ObjectMapper();
+        when(objectMapper.readValue(eq("{\"key\":\"value\"}"), eq(Object.class)))
+                .thenReturn(realMapper.readValue("{\"key\":\"value\"}", Object.class));
+
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("deserializeJsonField", Map.class);
+        method.setAccessible(true);
+        method.invoke(notificationService, map);
+
+        assertTrue(map.get(METADATA) instanceof Map);
+    }
+
+    @Test
+    void testDeserializeJsonField_InvalidJson_LeavesFieldUnchanged() throws Exception {
+        Map<String, Object> map = new HashMap<>();
+        map.put(METADATA, "not-json");
+        when(objectMapper.readValue(eq("not-json"), eq(Object.class)))
+                .thenThrow(new RuntimeException("parse error"));
+
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("deserializeJsonField", Map.class);
+        method.setAccessible(true);
+        method.invoke(notificationService, map);
+
+        assertEquals("not-json", map.get(METADATA));
+    }
+
+    // ===================== Additional coverage: markIndividualNotificationAsRead / handleNormalReadFlow branches =====================
+
+    @Test
+    void testMarkNotificationsAsRead_IndividualV2_PeerReviewAssigned_NormalFlow_SkipsKafkaPublish() {
+        String userId = "user-1";
+        String notificationId = "notif-1";
+        String createdAtStr = "2026-03-10T10:00:00Z";
+        Instant createdAt = Instant.parse(createdAtStr);
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(userId);
+        Map<String, Object> notification = new HashMap<>();
+        notification.put(NOTIFICATION_ID, notificationId);
+        notification.put(CREATED_AT, createdAt);
+        notification.put(CATEGORY, "PEER_VALIDATION");
+        notification.put(SUB_CATEGORY, "PEER_REVIEW_ASSIGNED");
+        notification.put(READ, false);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), isNull(), anyInt()))
+                .thenReturn(List.of(notification));
+        when(cassandraOperation.updateRecord(anyString(), anyString(), anyMap(), anyMap()))
+                .thenReturn(Map.of(RESPONSE, Constants.SUCCESS));
+        Map<String, Object> request = new HashMap<>();
+        request.put(TYPE, INDIVIDUAL);
+        request.put("ids", List.of(notificationId));
+        request.put(CREATED_AT, createdAtStr);
+        ApiResponse response = notificationService.markNotificationsAsRead(AUTH_TOKEN, request, API_VERSION_V2);
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        verify(producer, never()).push(anyString(), anyMap());
+        verify(cassandraOperation).updateRecord(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION),
+                argThat(m -> Boolean.TRUE.equals(m.get(READ))),
+                eq(Map.of(USER_ID, userId, CREATED_AT, createdAt)));
+    }
+
+    @Test
+    void testMarkNotificationsAsRead_IndividualV2_NonPeerValidation_CreatedAtAsString() {
+        String userId = "user-1";
+        String notificationId = "notif-1";
+        String createdAtStr = "2026-03-10T10:00:00Z";
+        Instant createdAt = Instant.parse(createdAtStr);
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(userId);
+        Map<String, Object> notification = new HashMap<>();
+        notification.put(NOTIFICATION_ID, notificationId);
+        notification.put(CREATED_AT, createdAt);
+        notification.put(CATEGORY, "GENERAL");
+        notification.put(SUB_CATEGORY, "INFO");
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), isNull(), anyInt()))
+                .thenReturn(List.of(notification));
+        when(cassandraOperation.updateRecord(anyString(), anyString(), anyMap(), anyMap()))
+                .thenReturn(Map.of(RESPONSE, Constants.SUCCESS));
+        Map<String, Object> request = new HashMap<>();
+        request.put(TYPE, INDIVIDUAL);
+        request.put("ids", List.of(notificationId));
+        request.put(CREATED_AT, createdAtStr);
+        ApiResponse response = notificationService.markNotificationsAsRead(AUTH_TOKEN, request, API_VERSION_V2);
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        verify(cassandraOperation).updateRecord(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION),
+                argThat(m -> Boolean.TRUE.equals(m.get(READ))),
+                eq(Map.of(USER_ID, userId, CREATED_AT, createdAt)));
+    }
+
+    private Map<String, Object> buildPeerEvalNotificationForRead(String notificationId, Instant createdAt) {
+        Map<String, Object> notification = new HashMap<>();
+        notification.put(NOTIFICATION_ID, notificationId);
+        notification.put(CREATED_AT, createdAt);
+        notification.put(CATEGORY, "PEER_VALIDATION");
+        notification.put(SUB_CATEGORY, "PEER_EVALUATION_ASSIGNED");
+        notification.put(READ, false);
+        return notification;
+    }
+
+    @Test
+    void testMarkNotificationsAsRead_IndividualV2_PeerEvaluation_MessageBlank_SkipsPublish() {
+        String userId = "user-1";
+        String notificationId = "notif-1";
+        String createdAtStr = "2026-03-10T10:00:00Z";
+        Instant createdAt = Instant.parse(createdAtStr);
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(userId);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), isNull(), anyInt()))
+                .thenReturn(List.of(buildPeerEvalNotificationForRead(notificationId, createdAt)));
+        when(cassandraOperation.updateRecord(anyString(), anyString(), anyMap(), anyMap()))
+                .thenReturn(Map.of(RESPONSE, Constants.SUCCESS));
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), eq(List.of(MESSAGE)), eq(1)))
+                .thenReturn(List.of(Map.of(MESSAGE, "")));
+        Map<String, Object> request = new HashMap<>();
+        request.put(TYPE, INDIVIDUAL);
+        request.put("ids", List.of(notificationId));
+        request.put(CREATED_AT, createdAtStr);
+        ApiResponse response = notificationService.markNotificationsAsRead(AUTH_TOKEN, request, API_VERSION_V2);
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        verify(producer, never()).push(anyString(), anyMap());
+    }
+
+    @Test
+    void testMarkNotificationsAsRead_IndividualV2_PeerEvaluation_MessageDataEmpty_SkipsPublish() throws Exception {
+        String userId = "user-1";
+        String notificationId = "notif-1";
+        String createdAtStr = "2026-03-10T10:00:00Z";
+        Instant createdAt = Instant.parse(createdAtStr);
+        String messageJson = "{\"data\": []}";
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(userId);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), isNull(), anyInt()))
+                .thenReturn(List.of(buildPeerEvalNotificationForRead(notificationId, createdAt)));
+        when(cassandraOperation.updateRecord(anyString(), anyString(), anyMap(), anyMap()))
+                .thenReturn(Map.of(RESPONSE, Constants.SUCCESS));
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), eq(List.of(MESSAGE)), eq(1)))
+                .thenReturn(List.of(Map.of(MESSAGE, messageJson)));
+        Map<String, Object> messageMap = new HashMap<>();
+        messageMap.put(DATA, Collections.emptyList());
+        when(objectMapper.readValue(eq(messageJson), ArgumentMatchers.<TypeReference<Map<String, Object>>>any())).thenReturn(messageMap);
+        Map<String, Object> request = new HashMap<>();
+        request.put(TYPE, INDIVIDUAL);
+        request.put("ids", List.of(notificationId));
+        request.put(CREATED_AT, createdAtStr);
+        ApiResponse response = notificationService.markNotificationsAsRead(AUTH_TOKEN, request, API_VERSION_V2);
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        verify(producer, never()).push(anyString(), anyMap());
+    }
+
+    @Test
+    void testMarkNotificationsAsRead_IndividualV2_PeerEvaluation_FormIdBlank_SkipsPublish() throws Exception {
+        String userId = "user-1";
+        String notificationId = "notif-1";
+        String createdAtStr = "2026-03-10T10:00:00Z";
+        Instant createdAt = Instant.parse(createdAtStr);
+        String messageJson = "{\"data\": [{\"formId\": \"\"}]}";
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(userId);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), isNull(), anyInt()))
+                .thenReturn(List.of(buildPeerEvalNotificationForRead(notificationId, createdAt)));
+        when(cassandraOperation.updateRecord(anyString(), anyString(), anyMap(), anyMap()))
+                .thenReturn(Map.of(RESPONSE, Constants.SUCCESS));
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), eq(List.of(MESSAGE)), eq(1)))
+                .thenReturn(List.of(Map.of(MESSAGE, messageJson)));
+        Map<String, Object> messageMap = new HashMap<>();
+        messageMap.put(DATA, List.of(Map.of(Constants.FORM_ID, "")));
+        when(objectMapper.readValue(eq(messageJson), ArgumentMatchers.<TypeReference<Map<String, Object>>>any())).thenReturn(messageMap);
+        Map<String, Object> request = new HashMap<>();
+        request.put(TYPE, INDIVIDUAL);
+        request.put("ids", List.of(notificationId));
+        request.put(CREATED_AT, createdAtStr);
+        ApiResponse response = notificationService.markNotificationsAsRead(AUTH_TOKEN, request, API_VERSION_V2);
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        verify(producer, never()).push(anyString(), anyMap());
+    }
+
+    // ===================== Additional coverage: updatePeerEvaluationStatus (previously untested) =====================
+
+    @Test
+    void testUpdatePeerEvaluationStatus_InvalidStatus_NoOp() {
+        notificationService.updatePeerEvaluationStatus(USER_ID, "notif-1", Instant.now().toString(), "PENDING");
+        verifyNoInteractions(cassandraOperation);
+    }
+
+    @Test
+    void testUpdatePeerEvaluationStatus_InvalidCreatedAtFormat_CatchesAndLogs() {
+        notificationService.updatePeerEvaluationStatus(USER_ID, "notif-1", "not-a-date", "APPROVED");
+        verifyNoInteractions(cassandraOperation);
+    }
+
+    @Test
+    void testUpdatePeerEvaluationStatus_ReviewRecordNotFound_ReturnsEarly() {
+        String createdAt = Instant.now().toString();
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_PEER_VALIDATION_REVIEWS), anyMap(), eq(List.of(STATUS)), eq(1)))
+                .thenReturn(Collections.emptyList());
+        notificationService.updatePeerEvaluationStatus(USER_ID, "notif-1", createdAt, "APPROVED");
+        verify(cassandraOperation, never()).updateRecord(any(), any(), anyMap(), anyMap());
+    }
+
+    @Test
+    void testUpdatePeerEvaluationStatus_ReviewAlreadyTerminal_ReturnsEarly() {
+        String createdAt = Instant.now().toString();
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_PEER_VALIDATION_REVIEWS), anyMap(), eq(List.of(STATUS)), eq(1)))
+                .thenReturn(List.of(Map.of(STATUS, "APPROVED")));
+        notificationService.updatePeerEvaluationStatus(USER_ID, "notif-1", createdAt, "REJECTED");
+        verify(cassandraOperation, never()).updateRecord(any(), any(), anyMap(), anyMap());
+    }
+
+    @Test
+    void testUpdatePeerEvaluationStatus_UserNotificationRecordNotFound_ReturnsEarly() {
+        String createdAt = Instant.now().toString();
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_PEER_VALIDATION_REVIEWS), anyMap(), eq(List.of(STATUS)), eq(1)))
+                .thenReturn(List.of(Map.of(STATUS, "PENDING")));
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), eq(List.of(STATUS)), eq(1)))
+                .thenReturn(Collections.emptyList());
+        notificationService.updatePeerEvaluationStatus(USER_ID, "notif-1", createdAt, "APPROVED");
+        verify(cassandraOperation, never()).updateRecord(any(), any(), anyMap(), anyMap());
+    }
+
+    @Test
+    void testUpdatePeerEvaluationStatus_UserNotificationAlreadyTerminal_ReturnsEarly() {
+        String createdAt = Instant.now().toString();
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_PEER_VALIDATION_REVIEWS), anyMap(), eq(List.of(STATUS)), eq(1)))
+                .thenReturn(List.of(Map.of(STATUS, "PENDING")));
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), eq(List.of(STATUS)), eq(1)))
+                .thenReturn(List.of(Map.of(STATUS, "REJECTED")));
+        notificationService.updatePeerEvaluationStatus(USER_ID, "notif-1", createdAt, "APPROVED");
+        verify(cassandraOperation, never()).updateRecord(any(), any(), anyMap(), anyMap());
+    }
+
+    @Test
+    void testUpdatePeerEvaluationStatus_Success_UpdatesBothTables() {
+        String createdAtStr = "2026-03-10T10:00:00Z";
+        Instant createdAt = Instant.parse(createdAtStr);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_PEER_VALIDATION_REVIEWS), anyMap(), eq(List.of(STATUS)), eq(1)))
+                .thenReturn(List.of(Map.of(STATUS, "PENDING")));
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), eq(List.of(STATUS)), eq(1)))
+                .thenReturn(List.of(Map.of(STATUS, "PENDING")));
+
+        notificationService.updatePeerEvaluationStatus(USER_ID, "notif-1", createdAtStr, "APPROVED");
+
+        verify(cassandraOperation).updateRecord(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_PEER_VALIDATION_REVIEWS),
+                argThat(m -> "APPROVED".equals(m.get(STATUS))),
+                eq(Map.of(USER_ID, USER_ID, NOTIFICATION_ID, "notif-1")));
+        verify(cassandraOperation).updateRecord(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION),
+                argThat(m -> "APPROVED".equals(m.get(STATUS))),
+                eq(Map.of(USER_ID, USER_ID, CREATED_AT, createdAt)));
+    }
+
+    @Test
+    void testUpdatePeerEvaluationStatus_UnexpectedException_CaughtAndLogged() {
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_PEER_VALIDATION_REVIEWS), anyMap(), eq(List.of(STATUS)), eq(1)))
+                .thenThrow(new RuntimeException("Cassandra down"));
+        assertDoesNotThrow(() ->
+                notificationService.updatePeerEvaluationStatus(USER_ID, "notif-1", Instant.now().toString(), "APPROVED"));
+    }
+
+    // ===================== Additional branch coverage: round 2 =====================
+
+    @Test
+    void testCreateNotification_RequestNodeNotObject_ReturnsBadRequest() throws Exception {
+        String authToken = "Bearer token";
+        ObjectMapper mapper = new ObjectMapper();
+        String payload = "{ \"request\": \"not-an-object\" }";
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+        when(accessTokenValidator.fetchUserIdFromAccessToken(authToken)).thenReturn("testUser");
+
+        ApiResponse response = notificationService.createNotification(userNotificationDetail, authToken);
+
+        assertEquals(HttpStatus.BAD_REQUEST, response.getResponseCode());
+        assertEquals(Constants.INVALID_PAYLOAD_ERR_MSG, response.getParams().getErrMsg());
+    }
+
+    @Test
+    void testCreateNotification_SettingPresentAndEnabled_ProceedsNormally() throws Exception {
+        String authToken = "Bearer token";
+        String userId = "testUser";
+        String payload = "{ \"request\": { \"type\": \"comment\" } }";
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+
+        NotificationSettingEntity enabled = new NotificationSettingEntity();
+        enabled.setEnabled(true);
+        when(accessTokenValidator.fetchUserIdFromAccessToken(authToken)).thenReturn(userId);
+        when(notificationSettingRepository.findByUserIdAndNotificationTypeAndIsDeletedFalse(userId, "comment"))
+                .thenReturn(Optional.of(enabled));
+        when(cassandraOperation.insertRecord(anyString(), anyString(), anyMap()))
+                .thenReturn(Map.of("response", "SUCCESS"));
+
+        ApiResponse response = notificationService.createNotification(userNotificationDetail, authToken);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        assertNotNull(response.getResult());
+    }
+
+    @Test
+    void testBulkCreateNotifications_RequestNodeNotObject_ReturnsBadRequest() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        String payload = "{ \"request\": \"not-an-object\" }";
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+
+        ApiResponse response = notificationService.bulkCreateNotifications(userNotificationDetail);
+
+        assertEquals(HttpStatus.BAD_REQUEST, response.getResponseCode());
+        assertEquals(Constants.INVALID_PAYLOAD_ERR_MSG, response.getParams().getErrMsg());
+    }
+
+    @Test
+    void testBulkCreateNotifications_UserIdsNotArray_ReturnsBadRequest() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        String payload = "{ \"request\": { \"type\": \"comment\", \"user_ids\": \"not-an-array\" } }";
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+
+        ApiResponse response = notificationService.bulkCreateNotifications(userNotificationDetail);
+
+        assertEquals(HttpStatus.BAD_REQUEST, response.getResponseCode());
+        assertEquals("'user_ids' must be a non-empty list", response.getParams().getErrMsg());
+    }
+
+    @Test
+    void testBulkCreateNotifications_UserIdEntryMissingKey_SkipsEntry() throws Exception {
+        String payload = "{ \"request\": { " +
+                "\"type\": \"comment\"," +
+                "\"sub_category\": \"CONTENT_PUBLISHED\"," +
+                "\"user_ids\": [ {}, {\"user_id\": \"user1\"} ]" +
+                "} }";
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+
+        ApiResponse mockInsertResponse = new ApiResponse();
+        mockInsertResponse.setResponseCode(HttpStatus.OK);
+        when(cassandraOperation.insertBulkRecord(anyString(), anyString(), anyList()))
+                .thenReturn(mockInsertResponse);
+
+        ApiResponse response = notificationService.bulkCreateNotifications(userNotificationDetail);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        List<Map<String, Object>> notifications = (List<Map<String, Object>>) result.get("notifications");
+        assertEquals(1, notifications.size());
+    }
+
+    @Test
+    void testBulkCreateNotifications_MessageDataPresentButNotObject_CreatesNewDataNode() throws Exception {
+        String payload = "{ \"request\": { " +
+                "\"type\": \"comment\"," +
+                "\"sub_category\": \"CONTENT_PUBLISHED\"," +
+                "\"message\": {\"title\": \"hello\", \"data\": \"not-an-object\"}," +
+                "\"user_ids\": [ {\"user_id\": \"user1\"} ]" +
+                "} }";
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+
+        ApiResponse mockInsertResponse = new ApiResponse();
+        mockInsertResponse.setResponseCode(HttpStatus.OK);
+        when(cassandraOperation.insertBulkRecord(anyString(), anyString(), anyList()))
+                .thenReturn(mockInsertResponse);
+
+        ApiResponse response = notificationService.bulkCreateNotifications(userNotificationDetail);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        ArgumentCaptor<List<Map<String, Object>>> captor = ArgumentCaptor.forClass(List.class);
+        verify(cassandraOperation).insertBulkRecord(anyString(), anyString(), captor.capture());
+        String messageStr = (String) captor.getValue().get(0).get(Constants.MESSAGE);
+        assertNotNull(messageStr);
+        assertTrue(messageStr.contains("\"count\":1"));
+    }
+
+    @Test
+    void testBulkCreateNotifications_InsertBulkRecordReturnsNull_ProceedsNormally() throws Exception {
+        String payload = "{ \"request\": { " +
+                "\"type\": \"comment\"," +
+                "\"sub_category\": \"CONTENT_PUBLISHED\"," +
+                "\"user_ids\": [ {\"user_id\": \"user1\"} ]" +
+                "} }";
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode userNotificationDetail = mapper.readTree(payload);
+
+        // insertBulkRecord's declared return type is ApiResponse, so a non-ApiResponse value can
+        // never flow through it at runtime; null is the only way to make "instanceof ApiResponse" false.
+        when(cassandraOperation.insertBulkRecord(anyString(), anyString(), anyList()))
+                .thenReturn(null);
+
+        ApiResponse response = notificationService.bulkCreateNotifications(userNotificationDetail);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        List<Map<String, Object>> notifications = (List<Map<String, Object>>) result.get("notifications");
+        assertEquals(1, notifications.size());
+    }
+
+    @Test
+    void testIsGlobalSubCategory_CoursePublished_ReturnsTrue() throws Exception {
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("isGlobalSubCategory", NotificationSubCategory.class);
+        method.setAccessible(true);
+        boolean result = (boolean) method.invoke(notificationService, NotificationSubCategory.COURSE_PUBLISHED);
+        assertTrue(result);
+    }
+
+    @Test
+    void testIsGlobalSubCategory_ProgramPublished_ReturnsTrue() throws Exception {
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("isGlobalSubCategory", NotificationSubCategory.class);
+        method.setAccessible(true);
+        boolean result = (boolean) method.invoke(notificationService, NotificationSubCategory.PROGRAM_PUBLISHED);
+        assertTrue(result);
+    }
+
+    @Test
+    void testCreateGlobalNotification_FieldIsNonValueNode_UsesToString() throws Exception {
+        ObjectMapper realMapper = new ObjectMapper();
+        String payload = "{ \"type\": \"content\", \"role\": {\"nested\": \"obj\"} }";
+        JsonNode request = realMapper.readTree(payload);
+
+        when(cassandraOperation.insertRecord(anyString(), anyString(), anyMap()))
+                .thenReturn(Map.of(Constants.RESPONSE, Constants.SUCCESS));
+
+        ApiResponse response = notificationService.createGlobalNotification(
+                NotificationSubCategory.EVENT_PUBLISHED, request);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        ArgumentCaptor<Map<String, Object>> captor = ArgumentCaptor.forClass(Map.class);
+        verify(cassandraOperation).insertRecord(anyString(), anyString(), captor.capture());
+        assertTrue(((String) captor.getValue().get("role")).contains("nested"));
+    }
+
+    @Test
+    void testGetNotificationsByUserIdAndLastXDays_SettingPresentAndEnabled_ProceedsNormally() {
+        String authToken = "Bearer xyz";
+        String userId = "user-enabled";
+        when(accessTokenValidator.fetchUserIdFromAccessToken(authToken)).thenReturn(userId);
+        NotificationSettingEntity enabled = new NotificationSettingEntity();
+        enabled.setEnabled(true);
+        when(notificationSettingRepository.findByUserIdAndNotificationTypeAndIsDeletedFalse(anyString(), anyString()))
+                .thenReturn(Optional.of(enabled));
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(Constants.TABLE_USER_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of());
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(Constants.TABLE_GLOBAL_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of());
+
+        ApiResponse response = notificationService.getNotificationsByUserIdAndLastXDays(
+                authToken, 7, 0, 10, null, null);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+    }
+
+    @Test
+    void testGetNotificationsByUserIdAndLastXDays_SkipsGlobalNotificationAlreadyInUserList() {
+        String authToken = "Bearer xyz";
+        String userId = "user-overlap";
+        Instant now = Instant.now();
+        when(accessTokenValidator.fetchUserIdFromAccessToken(authToken)).thenReturn(userId);
+
+        Map<String, Object> userNotif = new HashMap<>();
+        userNotif.put(NOTIFICATION_ID, "shared-id");
+        userNotif.put(Constants.CREATED_AT, now.minusSeconds(10));
+        userNotif.put(Constants.IS_DELETED, false);
+        userNotif.put(Constants.READ, false);
+
+        Map<String, Object> globalNotif = new HashMap<>();
+        globalNotif.put(NOTIFICATION_ID, "shared-id");
+        globalNotif.put(Constants.CREATED_AT, now.minusSeconds(20));
+        globalNotif.put(Constants.IS_DELETED, false);
+
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(Constants.TABLE_USER_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of(userNotif));
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(Constants.TABLE_GLOBAL_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of(globalNotif));
+
+        NotificationServiceImpl spyService = Mockito.spy(notificationService);
+        doAnswer(invocation -> invocation.getArgument(0)).when(spyService).prepareNotificationResponse(any());
+
+        ApiResponse response = spyService.getNotificationsByUserIdAndLastXDays(
+                authToken, 7, 0, 10, null, null);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        List<Map<String, Object>> notifications = (List<Map<String, Object>>) result.get(NOTIFICATIONS);
+        assertEquals(1, notifications.size());
+    }
+
+    @Test
+    void testGetNotificationsByUserIdAndLastXDays_ExcludesRecordWithNullCreatedAt() {
+        String authToken = "Bearer xyz";
+        String userId = "user-nullcreated";
+        when(accessTokenValidator.fetchUserIdFromAccessToken(authToken)).thenReturn(userId);
+
+        Map<String, Object> notif = new HashMap<>();
+        notif.put(NOTIFICATION_ID, "n1");
+        notif.put(Constants.IS_DELETED, false);
+        notif.put(Constants.READ, false);
+        // no CREATED_AT at all -> getInstant returns null
+
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(Constants.TABLE_USER_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of(notif));
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(Constants.TABLE_GLOBAL_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of());
+
+        ApiResponse response = notificationService.getNotificationsByUserIdAndLastXDays(
+                authToken, 7, 0, 10, null, null);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        assertEquals(0, result.get(TOTAL_COUNT));
+    }
+
+    @Test
+    void testGetNotificationsByUserIdAndLastXDays_ExcludesRecordBeforeFromDate() {
+        String authToken = "Bearer xyz";
+        String userId = "user-olddate";
+        Instant veryOld = Instant.now().minus(java.time.Duration.ofDays(365));
+        when(accessTokenValidator.fetchUserIdFromAccessToken(authToken)).thenReturn(userId);
+
+        Map<String, Object> notif = new HashMap<>();
+        notif.put(NOTIFICATION_ID, "n1");
+        notif.put(Constants.CREATED_AT, veryOld);
+        notif.put(Constants.IS_DELETED, false);
+        notif.put(Constants.READ, false);
+
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(Constants.TABLE_USER_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of(notif));
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(Constants.TABLE_GLOBAL_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of());
+
+        ApiResponse response = notificationService.getNotificationsByUserIdAndLastXDays(
+                authToken, 7, 0, 10, null, null);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        assertEquals(0, result.get(TOTAL_COUNT));
+    }
+
+    @Test
+    void testGetNotificationsByUserIdAndLastXDays_HasNextPageTrue() {
+        String authToken = "Bearer xyz";
+        String userId = "user-paged";
+        Instant now = Instant.now();
+        List<Map<String, Object>> notifs = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            Map<String, Object> n = new HashMap<>();
+            n.put(NOTIFICATION_ID, "n" + i);
+            n.put(Constants.CREATED_AT, now.minusSeconds(i));
+            n.put(Constants.IS_DELETED, false);
+            n.put(Constants.READ, false);
+            notifs.add(n);
+        }
+        when(accessTokenValidator.fetchUserIdFromAccessToken(authToken)).thenReturn(userId);
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(Constants.TABLE_USER_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(notifs);
+        when(cassandraOperation.getRecordsByProperties(
+                anyString(), eq(Constants.TABLE_GLOBAL_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of());
+
+        NotificationServiceImpl spyService = Mockito.spy(notificationService);
+        doAnswer(invocation -> invocation.getArgument(0)).when(spyService).prepareNotificationResponse(any());
+
+        ApiResponse response = spyService.getNotificationsByUserIdAndLastXDays(
+                authToken, 7, 0, 2, null, null);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        assertEquals(true, result.get(HAS_NEXT_PAGE));
+    }
+
+    @Test
+    void testMarkNotificationsAsRead_GlobalActionIndividualType_MissingIds_ReturnsBadRequest() {
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(USER_ID);
+        Map<String, Object> request = new HashMap<>();
+        request.put(TYPE, INDIVIDUAL);
+        request.put(ACTION, GLOBAL);
+        ApiResponse response = notificationService.markNotificationsAsRead(AUTH_TOKEN, request, Constants.API_VERSION_V1);
+        assertEquals(HttpStatus.BAD_REQUEST, response.getResponseCode());
+    }
+
+    @Test
+    void testGetUnreadNotificationCount_CountRecordsNull_TreatedAsEmpty() {
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(USER_ID);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_UNREAD_NOTIFICATION_COUNT), anyMap(), anyList(), eq(1)))
+                .thenReturn(null);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_GLOBAL_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(Collections.emptyList());
+
+        ApiResponse response = notificationService.getUnreadNotificationCount(AUTH_TOKEN, 7);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        assertEquals(0, result.get("unread"));
+    }
+
+    @Test
+    void testGetUnreadNotificationCount_RecordIsNull_SkipsProcessing() {
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(USER_ID);
+        List<Map<String, Object>> countRecords = new ArrayList<>();
+        countRecords.add(null);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_UNREAD_NOTIFICATION_COUNT), anyMap(), anyList(), eq(1)))
+                .thenReturn(countRecords);
+
+        ApiResponse response = notificationService.getUnreadNotificationCount(AUTH_TOKEN, 7);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        assertEquals(0, result.get("unread"));
+    }
+
+    @Test
+    void testGetUnreadNotificationCount_GlobalNotificationsAfterLastUpdated_AllCombinationsCovered() {
+        Instant lastUpdated = Instant.now().minusSeconds(1000);
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(USER_ID);
+
+        Map<String, Object> countRecord = new HashMap<>();
+        countRecord.put(COUNT, 3);
+        countRecord.put(UPDATED_AT, lastUpdated);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_UNREAD_NOTIFICATION_COUNT), anyMap(), anyList(), eq(1)))
+                .thenReturn(List.of(countRecord));
+
+        Map<String, Object> afterUpdate = new HashMap<>();
+        afterUpdate.put(Constants.CREATED_AT, Instant.now());
+        Map<String, Object> beforeUpdate = new HashMap<>();
+        beforeUpdate.put(Constants.CREATED_AT, lastUpdated.minusSeconds(500));
+        Map<String, Object> notAnInstant = new HashMap<>();
+        notAnInstant.put(Constants.CREATED_AT, "not-an-instant");
+
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_GLOBAL_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of(afterUpdate, beforeUpdate, notAnInstant));
+
+        ApiResponse response = notificationService.getUnreadNotificationCount(AUTH_TOKEN, 7);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        assertEquals(4, result.get("unread")); // 3 existing + 1 global after lastUpdated
+    }
+
+    @Test
+    void testIncrementUnreadCountManually_RecordsNonEmptyButCountNull() throws Exception {
+        Map<String, Object> existing = new HashMap<>();
+        existing.put(COUNT, null);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_UNREAD_NOTIFICATION_COUNT), anyMap(), eq(List.of(COUNT)), eq(1)))
+                .thenReturn(List.of(existing));
+
+        Method method = NotificationServiceImpl.class.getDeclaredMethod(
+                "incrementUnreadCountManually", String.class, String.class, String.class);
+        method.setAccessible(true);
+        method.invoke(notificationService, KEYSPACE_SUNBIRD, TABLE_UNREAD_NOTIFICATION_COUNT, USER_ID);
+
+        verify(cassandraOperation).updateRecord(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_UNREAD_NOTIFICATION_COUNT),
+                argThat(m -> Integer.valueOf(1).equals(m.get(COUNT))),
+                anyMap());
+    }
+
+    @Test
+    void testFetchExistingUnreadCounts_SkipsNonNumberCount() throws Exception {
+        Set<String> userIds = new LinkedHashSet<>(List.of("u1"));
+        Map<String, Object> record = new HashMap<>();
+        record.put(USER_ID, "u1");
+        record.put(COUNT, "not-a-number");
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_UNREAD_NOTIFICATION_COUNT), anyMap(), anyList(), anyInt()))
+                .thenReturn(List.of(record));
+
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("fetchExistingUnreadCounts", Set.class);
+        method.setAccessible(true);
+        Map<String, Integer> result = (Map<String, Integer>) method.invoke(notificationService, userIds);
+
+        assertTrue(result.isEmpty());
+    }
+
+    @Test
+    void testBuildPeerValidationResponseEntry_CreatedAtNotInstant_LeavesUnchanged() throws Exception {
+        Map<String, Object> record = new HashMap<>();
+        record.put(CREATED_AT, "2026-01-01T00:00:00Z");
+        record.put(IS_DELETED, true);
+
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("buildPeerValidationResponseEntry", Map.class);
+        method.setAccessible(true);
+        Map<String, Object> result = (Map<String, Object>) method.invoke(notificationService, record);
+
+        assertEquals("2026-01-01T00:00:00Z", result.get(CREATED_AT));
+        assertFalse(result.containsKey(IS_DELETED));
+    }
+
+    @Test
+    void testValidateSingleNotificationRequest_FirstEntryNotMap_ReturnsError() throws Exception {
+        Map<String, Object> message = new LinkedHashMap<>();
+        message.put(DATA, List.of("not-a-map"));
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put(USER_ID, "user-1");
+        request.put(TYPE, "peer-review");
+        request.put(CATEGORY, "PEER_VALIDATION");
+        request.put(SUB_CATEGORY, "CONTENT_PUBLISHED");
+        request.put(SUB_TYPE, "peer_evaluation");
+        request.put(SOURCE, "competency-passbook");
+        request.put(MESSAGE, message);
+
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("validateSingleNotificationRequest", Map.class);
+        method.setAccessible(true);
+        String result = (String) method.invoke(notificationService, request);
+
+        assertEquals(ERR_MESSAGE_DATA_REQUIRED, result);
+    }
+
+    @Test
+    void testDeserializeJsonField_BlankString_LeavesUnchanged() throws Exception {
+        Map<String, Object> map = new HashMap<>();
+        map.put(METADATA, "   ");
+
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("deserializeJsonField", Map.class);
+        method.setAccessible(true);
+        method.invoke(notificationService, map);
+
+        assertEquals("   ", map.get(METADATA));
+        verifyNoInteractions(objectMapper);
+    }
+
+    @Test
+    void testHandleStatusBasedAction_NeitherCategory_OnlyUpdatesUserNotification() throws Exception {
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("handleStatusBasedAction", String.class, String.class, Instant.class, Instant.class, String.class, String.class);
+        method.setAccessible(true);
+        String userId = "user-123";
+        String notificationId = "notif-456";
+        Instant createdAt = Instant.parse("2026-03-15T10:00:00Z");
+        Instant now = Instant.now();
+        String status = "SKIP_FOR_NOW";
+        when(cassandraOperation.updateRecord(anyString(), anyString(), anyMap(), anyMap()))
+                .thenReturn(Map.of(RESPONSE, Constants.SUCCESS));
+        method.invoke(notificationService, userId, notificationId, createdAt, now, status, "SOME_OTHER_CATEGORY");
+        verify(cassandraOperation, times(1)).updateRecord(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_USER_NOTIFICATION), anyMap(), anyMap());
+        verify(cassandraOperation, never()).updateRecord(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_PEER_VALIDATION_REQUESTS), anyMap(), anyMap());
+        verify(cassandraOperation, never()).updateRecord(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_PEER_VALIDATION_REVIEWS), anyMap(), anyMap());
+    }
+
+    @Test
+    void testPersistActionRecordsBySubCategory_NeitherCategory_SkipsBothTables() throws Exception {
+        Map<String, Object> actionRecord = new HashMap<>();
+        actionRecord.put(SUB_CATEGORY, "SOME_OTHER_CATEGORY");
+        actionRecord.put(NOTIFICATION_ID, "n1");
+
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("persistActionRecordsBySubCategory", List.class);
+        method.setAccessible(true);
+        method.invoke(notificationService, List.of(actionRecord));
+
+        verify(cassandraOperation, never()).insertBulkRecord(anyString(), eq(TABLE_PEER_VALIDATION_REQUESTS), anyList());
+        verify(cassandraOperation, never()).insertBulkRecord(anyString(), eq(TABLE_PEER_VALIDATION_REVIEWS), anyList());
+    }
+
+    @Test
+    void testIsWithinDateWindow_AllBranches() throws Exception {
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("isWithinDateWindow", Map.class, Instant.class);
+        method.setAccessible(true);
+        Instant fromDate = Instant.now().minusSeconds(100);
+
+        Map<String, Object> nullCreatedAt = new HashMap<>();
+        assertFalse((boolean) method.invoke(notificationService, nullCreatedAt, fromDate));
+
+        Map<String, Object> beforeFromDate = Map.of(CREATED_AT, fromDate.minusSeconds(500));
+        assertFalse((boolean) method.invoke(notificationService, beforeFromDate, fromDate));
+
+        Map<String, Object> afterFromDate = Map.of(CREATED_AT, fromDate.plusSeconds(500));
+        assertTrue((boolean) method.invoke(notificationService, afterFromDate, fromDate));
+    }
+
+    @Test
+    void testIsStatusAllowed_AllBranches() throws Exception {
+        Method method = NotificationServiceImpl.class.getDeclaredMethod("isStatusAllowed", Map.class, Set.class);
+        method.setAccessible(true);
+        Set<String> exclusionSet = Set.of("SUBMITTED", "IGNORED");
+
+        Map<String, Object> blankStatus = new HashMap<>();
+        assertTrue((boolean) method.invoke(notificationService, blankStatus, exclusionSet));
+
+        Map<String, Object> allowedStatus = Map.of(STATUS, "PENDING");
+        assertTrue((boolean) method.invoke(notificationService, allowedStatus, exclusionSet));
+
+        Map<String, Object> excludedStatus = Map.of(STATUS, "SUBMITTED");
+        assertFalse((boolean) method.invoke(notificationService, excludedStatus, exclusionSet));
+    }
+
+    // ===================== Additional branch coverage: round 3 =====================
+
+    @Test
+    void testCreateGlobalNotification_InsertReturnsApiResponseNotFailed_ProceedsNormally() {
+        ObjectMapper realMapper = new ObjectMapper();
+        JsonNode request = realMapper.createObjectNode().put(Constants.TYPE, "IN_APP");
+        ApiResponse successResponse = new ApiResponse();
+        successResponse.put(Constants.RESPONSE, Constants.SUCCESS);
+        when(cassandraOperation.insertRecord(anyString(), anyString(), anyMap()))
+                .thenReturn(successResponse);
+
+        ApiResponse response = notificationService.createGlobalNotification(
+                NotificationSubCategory.EVENT_PUBLISHED, request);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+    }
+
+    @Test
+    void testGetNotificationsByUserIdAndLastXDays_FiltersOutUnreadWhenStatusIsRead() {
+        String authToken = "Bearer abc";
+        String userId = "u-filterread";
+        Instant now = Instant.now();
+        Map<String, Object> notif = new HashMap<>();
+        notif.put(Constants.NOTIFICATION_ID, "n1");
+        notif.put(Constants.CREATED_AT, now);
+        notif.put(Constants.IS_DELETED, false);
+        notif.put(Constants.READ, false);
+
+        when(accessTokenValidator.fetchUserIdFromAccessToken(authToken)).thenReturn(userId);
+        when(cassandraOperation.getRecordsByProperties(any(), eq(Constants.TABLE_USER_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of(notif));
+        when(cassandraOperation.getRecordsByProperties(any(), eq(Constants.TABLE_GLOBAL_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of());
+
+        ApiResponse response = notificationService.getNotificationsByUserIdAndLastXDays(
+                authToken, 7, 0, 10, NotificationReadStatus.READ, null);
+
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        assertEquals(0, result.get(TOTAL_COUNT));
+    }
+
+    @Test
+    void testGetNotificationsByUserIdAndLastXDays_NegativeSize_ClampsFromIndexAndHandlesGracefully() {
+        String authToken = "Bearer abc";
+        String userId = "u-negsize";
+        Instant now = Instant.now();
+        List<Map<String, Object>> notifs = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            Map<String, Object> n = new HashMap<>();
+            n.put(NOTIFICATION_ID, "n" + i);
+            n.put(Constants.CREATED_AT, now.minusSeconds(i));
+            n.put(Constants.IS_DELETED, false);
+            n.put(Constants.READ, false);
+            notifs.add(n);
+        }
+        when(accessTokenValidator.fetchUserIdFromAccessToken(authToken)).thenReturn(userId);
+        when(cassandraOperation.getRecordsByProperties(any(), eq(Constants.TABLE_USER_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(notifs);
+        when(cassandraOperation.getRecordsByProperties(any(), eq(Constants.TABLE_GLOBAL_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of());
+
+        // page=1, size=-5 drives fromIndex (-5) above toIndex (-10), forcing the fromIndex>toIndex
+        // clamp at line 616; the resulting negative subList bounds surface as a handled 500.
+        ApiResponse response = notificationService.getNotificationsByUserIdAndLastXDays(
+                authToken, 7, 1, -5, null, null);
+
+        assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, response.getResponseCode());
+    }
+
+    @Test
+    void testGetUnreadNotificationCount_NoRecords_WithNonEmptyGlobalNotifications() {
+        when(accessTokenValidator.fetchUserIdFromAccessToken(AUTH_TOKEN)).thenReturn(USER_ID);
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_UNREAD_NOTIFICATION_COUNT), anyMap(), anyList(), eq(1)))
+                .thenReturn(Collections.emptyList());
+        when(cassandraOperation.getRecordsByProperties(
+                eq(KEYSPACE_SUNBIRD), eq(TABLE_GLOBAL_NOTIFICATION), anyMap(), any(), anyInt()))
+                .thenReturn(List.of(Map.of(NOTIFICATION_ID, "g1"), Map.of(NOTIFICATION_ID, "g2")));
+
+        ApiResponse response = notificationService.getUnreadNotificationCount(AUTH_TOKEN, 7);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        assertEquals(2, result.get("unread"));
     }
 }

@@ -8,8 +8,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
+import org.mockito.MockedStatic;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.lang.reflect.Method;
+import java.util.concurrent.CompletableFuture;
+
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -92,5 +98,76 @@ class PeerValidationStatusConsumerTest {
                 .updatePeerValidationStatusToSubmitted(anyString(), anyString(), anyString(), anyString());
         consumer.consumeStatusUpdate(VALID_MESSAGE);
         verify(producer, timeout(2000).times(1)).push(eq(ERROR_TOPIC), any());
+    }
+
+    @Test
+    void consumeStatusUpdate_asyncDispatchThrows_pushesToErrorTopicSynchronously() {
+        when(cbServerProperties.getKafkaTopicPeerValidationError()).thenReturn(ERROR_TOPIC);
+        try (MockedStatic<CompletableFuture> mockedStatic = mockStatic(CompletableFuture.class)) {
+            mockedStatic.when(() -> CompletableFuture.runAsync(any(Runnable.class)))
+                    .thenThrow(new RuntimeException("dispatch failure"));
+            consumer.consumeStatusUpdate(VALID_MESSAGE);
+        }
+        verify(producer, times(1)).push(eq(ERROR_TOPIC), any());
+        verify(notificationService, never()).updatePeerValidationStatusToSubmitted(any(), any(), any(), any());
+    }
+
+    @Test
+    void consumeStatusUpdate_missingUserId_doesNotCallService() {
+        String message = "{\"notificationId\":\"notif1\",\"createdAt\":\"2024-01-01T00:00:00Z\",\"subCategory\":\"PEER_EVALUATION_ASSIGNED\"}";
+        consumer.consumeStatusUpdate(message);
+        verify(notificationService, after(500).never()).updatePeerValidationStatusToSubmitted(any(), any(), any(), any());
+        verify(producer, after(500).never()).push(anyString(), any());
+    }
+
+    @Test
+    void consumeStatusUpdate_missingCreatedAt_doesNotCallService() {
+        String message = "{\"userId\":\"user1\",\"notificationId\":\"notif1\",\"subCategory\":\"PEER_EVALUATION_ASSIGNED\"}";
+        consumer.consumeStatusUpdate(message);
+        verify(notificationService, after(500).never()).updatePeerValidationStatusToSubmitted(any(), any(), any(), any());
+        verify(producer, after(500).never()).push(anyString(), any());
+    }
+
+    @Test
+    void consumeStatusUpdate_missingSubCategory_doesNotCallService() {
+        String message = "{\"userId\":\"user1\",\"notificationId\":\"notif1\",\"createdAt\":\"2024-01-01T00:00:00Z\"}";
+        consumer.consumeStatusUpdate(message);
+        verify(notificationService, after(500).never()).updatePeerValidationStatusToSubmitted(any(), any(), any(), any());
+        verify(producer, after(500).never()).push(anyString(), any());
+    }
+
+    @Test
+    void consumeStatusUpdate_blankNotificationId_doesNotCallService() {
+        String message = "{\"userId\":\"user1\",\"notificationId\":\"\",\"createdAt\":\"2024-01-01T00:00:00Z\",\"subCategory\":\"PEER_EVALUATION_ASSIGNED\"}";
+        consumer.consumeStatusUpdate(message);
+        verify(notificationService, after(500).never()).updatePeerValidationStatusToSubmitted(any(), any(), any(), any());
+        verify(producer, after(500).never()).push(anyString(), any());
+    }
+
+    @Test
+    void consumeStatusUpdate_blankCreatedAt_doesNotCallService() {
+        String message = "{\"userId\":\"user1\",\"notificationId\":\"notif1\",\"createdAt\":\"\",\"subCategory\":\"PEER_EVALUATION_ASSIGNED\"}";
+        consumer.consumeStatusUpdate(message);
+        verify(notificationService, after(500).never()).updatePeerValidationStatusToSubmitted(any(), any(), any(), any());
+        verify(producer, after(500).never()).push(anyString(), any());
+    }
+
+    @Test
+    void consumeStatusUpdate_blankSubCategory_doesNotCallService() {
+        String message = "{\"userId\":\"user1\",\"notificationId\":\"notif1\",\"createdAt\":\"2024-01-01T00:00:00Z\",\"subCategory\":\"\"}";
+        consumer.consumeStatusUpdate(message);
+        verify(notificationService, after(500).never()).updatePeerValidationStatusToSubmitted(any(), any(), any(), any());
+        verify(producer, after(500).never()).push(anyString(), any());
+    }
+
+    @Test
+    void statusUpdateRequestBuilder_toString_isCovered() throws Exception {
+        Class<?> requestClass = Class.forName("com.igot.cb.consumer.PeerValidationStatusConsumer$StatusUpdateRequest");
+        Method builderMethod = requestClass.getDeclaredMethod("builder");
+        builderMethod.setAccessible(true);
+        Object builder = builderMethod.invoke(null);
+        String result = builder.toString();
+        assertNotNull(result);
+        assertTrue(result.contains("StatusUpdateRequestBuilder"));
     }
 }
