@@ -64,4 +64,27 @@ class ConsumerTest {
 
         verify(notificationService, times(1)).bulkCreateNotifications(any(JsonNode.class));
     }
+
+    @Test
+    void testConsume_happyPath_forwardsToServiceDirectly() {
+        String message = "{ \"request\": { \"user_ids\": [{\"user_id\": \"user1\"}] } }";
+        ReflectionTestUtils.setField(consumer, "objectMapper", objectMapper);
+
+        consumer.consume(message);
+
+        verify(notificationService, times(1)).bulkCreateNotifications(any(JsonNode.class));
+    }
+
+    @Test
+    void testConsume_serviceThrowsException_directInvocation_logsError() {
+        String message = "{ \"request\": { \"user_ids\": [{\"user_id\": \"user1\"}] } }";
+        ReflectionTestUtils.setField(consumer, "objectMapper", objectMapper);
+
+        doThrow(new RuntimeException("direct test exception"))
+                .when(notificationService).bulkCreateNotifications(any(JsonNode.class));
+
+        consumer.consume(message);
+
+        verify(notificationService, times(1)).bulkCreateNotifications(any(JsonNode.class));
+    }
 }

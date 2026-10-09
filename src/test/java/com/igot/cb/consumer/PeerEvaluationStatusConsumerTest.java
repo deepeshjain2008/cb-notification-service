@@ -10,8 +10,14 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
+import org.mockito.MockedStatic;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.lang.reflect.Method;
+import java.util.concurrent.CompletableFuture;
+
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
@@ -101,5 +107,28 @@ class PeerEvaluationStatusConsumerTest {
                 .updatePeerEvaluationStatus(anyString(), anyString(), anyString(), anyString());
         consumer.consumeEvaluationUpdate(VALID_APPROVED_MESSAGE);
         verify(producer, timeout(2000).times(1)).push(eq(ERROR_TOPIC), any());
+    }
+
+    @Test
+    void consumeEvaluationUpdate_asyncDispatchThrows_pushesToErrorTopicSynchronously() {
+        when(cbServerProperties.getKafkaTopicPeerEvaluationError()).thenReturn(ERROR_TOPIC);
+        try (MockedStatic<CompletableFuture> mockedStatic = mockStatic(CompletableFuture.class)) {
+            mockedStatic.when(() -> CompletableFuture.runAsync(any(Runnable.class)))
+                    .thenThrow(new RuntimeException("dispatch failure"));
+            consumer.consumeEvaluationUpdate(VALID_APPROVED_MESSAGE);
+        }
+        verify(producer, times(1)).push(eq(ERROR_TOPIC), any());
+        verify(notificationService, never()).updatePeerEvaluationStatus(any(), any(), any(), any());
+    }
+
+    @Test
+    void evaluationUpdateRequestBuilder_toString_isCovered() throws Exception {
+        Class<?> requestClass = Class.forName("com.igot.cb.consumer.PeerEvaluationStatusConsumer$EvaluationUpdateRequest");
+        Method builderMethod = requestClass.getDeclaredMethod("builder");
+        builderMethod.setAccessible(true);
+        Object builder = builderMethod.invoke(null);
+        String result = builder.toString();
+        assertNotNull(result);
+        assertTrue(result.contains("EvaluationUpdateRequestBuilder"));
     }
 }
