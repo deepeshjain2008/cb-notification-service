@@ -148,6 +148,30 @@ class UserNotificationSettingServiceImplTest {
     }
 
     @Test
+    void testGetUserNotificationSettings_mergesExistingSettingForKnownType() {
+        // notificationType must match an actual NotificationType enum constant (e.g. IN_APP)
+        // so that existingMap.get(type.name()) resolves to a non-null setting.
+        NotificationSettingEntity entity = NotificationSettingEntity.builder()
+                .id(1L).userId("user1").notificationType("IN_APP").enabled(false)
+                .createdAt(LocalDateTime.now(ZoneOffset.UTC)).updatedAt(LocalDateTime.now(ZoneOffset.UTC))
+                .isDeleted(false).build();
+
+        when(accessTokenValidator.fetchUserIdFromAccessToken(token)).thenReturn("user1");
+        when(notificationSettingRepository.findByUserIdAndIsDeletedFalse("user1"))
+                .thenReturn(List.of(entity));
+
+        ApiResponse response = service.getUserNotificationSettings(token);
+
+        assertEquals(HttpStatus.OK, response.getResponseCode());
+        Map<String, Object> result = (Map<String, Object>) response.getResult();
+        List<?> settings = (List<?>) result.get(Constants.SETTINGS);
+        assertTrue(settings.stream().anyMatch(s -> {
+            Map<?, ?> m = (Map<?, ?>) s;
+            return "IN_APP".equals(m.get(Constants.NOTIFICATION_TYPE)) && Boolean.FALSE.equals(m.get(Constants.ENABLED));
+        }));
+    }
+
+    @Test
     void testGetUserNotificationSettings_invalidUser() {
         when(accessTokenValidator.fetchUserIdFromAccessToken(token)).thenReturn("");
 
@@ -200,6 +224,18 @@ class UserNotificationSettingServiceImplTest {
         when(accessTokenValidator.fetchUserIdFromAccessToken(token)).thenReturn("");
 
         ApiResponse response = service.deleteUserNotificationSetting(payload, token);
+
+        assertEquals(HttpStatus.BAD_REQUEST, response.getResponseCode());
+    }
+
+    @Test
+    void testDeleteUserNotificationSetting_invalidPayload() {
+        ObjectMapper realMapper = new ObjectMapper();
+        ObjectNode invalidPayload = realMapper.createObjectNode(); // missing "request"
+
+        when(accessTokenValidator.fetchUserIdFromAccessToken(token)).thenReturn("user1");
+
+        ApiResponse response = service.deleteUserNotificationSetting(invalidPayload, token);
 
         assertEquals(HttpStatus.BAD_REQUEST, response.getResponseCode());
     }
