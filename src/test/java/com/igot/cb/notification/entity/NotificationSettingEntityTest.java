@@ -250,4 +250,104 @@ class NotificationSettingEntityTest {
 
         assertEquals(e1, e2);
     }
+
+    @Test
+    void testEquals_notificationTypeNullVsNonNull() {
+        LocalDateTime now = LocalDateTime.now();
+        NotificationSettingEntity e1 = new NotificationSettingEntity(1L, "u1", null, true, now, now, false);
+        NotificationSettingEntity e2 = new NotificationSettingEntity(1L, "u1", "EMAIL", true, now, now, false);
+
+        assertNotEquals(e1, e2);
+        assertNotEquals(e2, e1);
+    }
+
+    @Test
+    void testEquals_notificationTypeBothNull() {
+        LocalDateTime now = LocalDateTime.now();
+        NotificationSettingEntity e1 = new NotificationSettingEntity(1L, "u1", null, true, now, now, false);
+        NotificationSettingEntity e2 = new NotificationSettingEntity(1L, "u1", null, true, now, now, false);
+
+        assertEquals(e1, e2);
+    }
+
+    @Test
+    void testEquals_createdAtNullVsNonNull() {
+        LocalDateTime now = LocalDateTime.now();
+        NotificationSettingEntity e1 = new NotificationSettingEntity(1L, "u1", "EMAIL", true, null, now, false);
+        NotificationSettingEntity e2 = new NotificationSettingEntity(1L, "u1", "EMAIL", true, now, now, false);
+
+        assertNotEquals(e1, e2);
+        assertNotEquals(e2, e1);
+    }
+
+    @Test
+    void testEquals_userIdNullVsNonNull() {
+        LocalDateTime now = LocalDateTime.now();
+        NotificationSettingEntity e1 = new NotificationSettingEntity(1L, null, "EMAIL", true, now, now, false);
+        NotificationSettingEntity e2 = new NotificationSettingEntity(1L, "u1", "EMAIL", true, now, now, false);
+
+        assertNotEquals(e1, e2);
+        assertNotEquals(e2, e1);
+    }
+
+    @Test
+    void testHashCode_enabledFalseAndDeletedTrue() {
+        LocalDateTime now = LocalDateTime.now();
+        NotificationSettingEntity e1 = new NotificationSettingEntity(1L, "u1", "EMAIL", false, now, now, true);
+        NotificationSettingEntity e2 = new NotificationSettingEntity(1L, "u1", "EMAIL", false, now, now, true);
+
+        assertEquals(e1.hashCode(), e2.hashCode());
+    }
+
+    @Test
+    void testHashCode_idNull() {
+        LocalDateTime now = LocalDateTime.now();
+        NotificationSettingEntity e1 = new NotificationSettingEntity(null, "u1", "EMAIL", true, now, now, false);
+        NotificationSettingEntity e2 = new NotificationSettingEntity(null, "u1", "EMAIL", true, now, now, false);
+
+        assertEquals(e1.hashCode(), e2.hashCode());
+    }
+
+    @Test
+    void testHashCode_notificationTypeNonNullVsNull() {
+        LocalDateTime now = LocalDateTime.now();
+        NotificationSettingEntity e1 = new NotificationSettingEntity(1L, "u1", "EMAIL", true, now, now, false);
+        NotificationSettingEntity e2 = new NotificationSettingEntity(1L, "u1", null, true, now, now, false);
+
+        assertNotEquals(e1.hashCode(), e2.hashCode());
+    }
+
+    @Test
+    void testBuilderToString() {
+        String str = NotificationSettingEntity.builder()
+                .id(1L)
+                .userId("u1")
+                .notificationType("EMAIL")
+                .toString();
+
+        assertTrue(str.contains("NotificationSettingEntity"));
+    }
+
+    private static class NonCanEqualSubclass extends NotificationSettingEntity {
+        @Override
+        public boolean canEqual(Object other) {
+            return false;
+        }
+    }
+
+    @Test
+    void testEquals_canEqualFalse() {
+        NotificationSettingEntity entity = new NotificationSettingEntity();
+        NonCanEqualSubclass other = new NonCanEqualSubclass();
+
+        assertNotEquals(entity, other);
+    }
+
+    @Test
+    void testCanEqual_directCalls() {
+        NotificationSettingEntity entity = new NotificationSettingEntity();
+
+        assertTrue(entity.canEqual(new NotificationSettingEntity()));
+        assertFalse(entity.canEqual("some string"));
+    }
 }

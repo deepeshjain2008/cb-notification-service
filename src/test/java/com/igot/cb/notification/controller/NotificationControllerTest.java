@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.igot.cb.notification.enums.NotificationReadStatus;
 import com.igot.cb.notification.service.NotificationService;
+import com.igot.cb.peervalidationcleanup.service.PeerValidationCleanupService;
 import com.igot.cb.util.Constants;
 
 import org.igot.common.ApiResponse;
@@ -27,6 +28,9 @@ class NotificationControllerTest {
 
     @Mock
     private NotificationService notificationService;
+
+    @Mock
+    private PeerValidationCleanupService peerValidationCleanupService;
 
     private ObjectMapper objectMapper = new ObjectMapper();
 
@@ -376,5 +380,13 @@ class NotificationControllerTest {
         ResponseEntity<?> response = notificationController.markNotificationsAsReadV2(token, requestBody);
         assertEquals(apiResponse, response.getBody());
         assertEquals(HttpStatus.OK, response.getStatusCode());
+    }
+
+    @Test
+    void testRunPeerValidationCleanup() {
+        ResponseEntity<Void> response = notificationController.runPeerValidationCleanup();
+
+        verify(peerValidationCleanupService, times(1)).runCleanup(any());
+        assertEquals(HttpStatus.ACCEPTED, response.getStatusCode());
     }
 }
